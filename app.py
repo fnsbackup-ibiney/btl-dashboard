@@ -13,7 +13,7 @@ CSV_URL = (
     f"https://docs.google.com/spreadsheets/d/{SHEET_ID}"
     f"/gviz/tq?tqx=out:csv&sheet={SHEET_NAME}"
 )
-CACHE_TTL = 300  # 5 分鐘
+CACHE_TTL = 300
 
 
 # ── 頁面設定 ─────────────────────────────────────────────
@@ -27,7 +27,6 @@ st.set_page_config(
 # ── 資料讀取(快取) ─────────────────────────────────────
 @st.cache_data(ttl=CACHE_TTL, show_spinner="正在從 Google Sheet 讀取最新資料...")
 def load_sheet():
-    """從 Google Sheet 抓取最新待處理清單。"""
     df = pd.read_csv(CSV_URL)
     df = df.iloc[:, :6]
     df.columns = ["優先級", "寄件者", "主旨", "收信日期", "等待時長", "郵件連結"]
@@ -55,10 +54,7 @@ try:
     df = load_sheet()
 except Exception as e:
     st.error(f"無法讀取 Google Sheet:{e}")
-    st.info(
-        "請確認 Sheet 已設為「任何取得連結的人都能檢視」,"
-        "或是 GAS 是否正常產出資料。"
-    )
+    st.info("請確認 Sheet 已設為「任何取得連結的人都能檢視」,或是 GAS 是否正常產出資料。")
     st.stop()
 
 
@@ -108,11 +104,29 @@ if keyword:
     ]
 
 
+# ── 寄件者去重複顯示 ────────────────────────────────────
+# 同一寄件者連續多列時,只在第一列顯示「寄件者 (N)」,後續留空
+# N = 此寄件者在當前篩選後清單中的總封數
+display_df = view_df.copy().reset_index(drop=True)
+sender_counts = display_df["寄件者"].value_counts().to_dict()
+
+deduped_senders = []
+prev_sender = None
+for s in display_df["寄件者"]:
+    if s == prev_sender:
+        deduped_senders.append("")
+    else:
+        n = sender_counts.get(s, 1)
+        deduped_senders.append(f"{s}  ({n})" if n > 1 else s)
+    prev_sender = s
+display_df["寄件者"] = deduped_senders
+
+
 # ── 表格 ───────────────────────────────────────────────
 st.subheader(f"📋 待處理清單  ({len(view_df)} 筆)")
 
 st.dataframe(
-    view_df,
+    display_df,
     width="stretch",
     hide_index=True,
     column_config={
