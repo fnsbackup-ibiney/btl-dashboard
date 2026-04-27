@@ -1,5 +1,6 @@
 # app.py
 # BTL Email Monitor Dashboard(Streamlit 版,讀取 Google Sheet)
+# 資料流:fnsbackup@ibiney.io → GAS(每小時+Gemini 摘要)→ Google Sheet → 此頁面
 
 import re
 from datetime import datetime
@@ -8,7 +9,6 @@ import streamlit as st
 
 
 def clean_sender(s: str) -> str:
-    """把 'Name <email@domain>' 簡化成 'Name'。"""
     if not s:
         return s
     s = re.sub(r"\s*<[^>]+>", "", str(s))
@@ -16,7 +16,6 @@ def clean_sender(s: str) -> str:
     return s
 
 
-# ── 設定 ─────────────────────────────────────────────────
 SHEET_ID = "1N6cTXNPIQlmKrOzQqB22WoZ6qkvdh-u4ATl1WDmc_A0"
 SHEET_NAME = "Sheet1"
 CSV_URL = (
@@ -25,19 +24,20 @@ CSV_URL = (
 )
 CACHE_TTL = 300
 
-st.set_page_config(
-    page_title="BTL Email Monitor",
-    page_icon="📧",
-    layout="wide",
-)
+st.set_page_config(page_title="BTL Email Monitor", page_icon="📧", layout="wide")
 
 
 @st.cache_data(ttl=CACHE_TTL, show_spinner="正在從 Google Sheet 讀取最新資料...")
 def load_sheet():
     df = pd.read_csv(CSV_URL)
-    df = df.iloc[:, :6]
-    df.columns = ["優先級", "寄件者", "主旨", "收信日期", "等待時長", "郵件連結"]
+    df = df.iloc[:, :7]
+    expected = ["優先級", "寄件者", "主旨", "收信日期", "等待時長", "郵件連結", "摘要"]
+    if df.shape[1] < 7:
+        df["摘要"] = ""
+    df.columns = expected[: df.shape[1]]
     df = df.dropna(subset=["優先級"]).reset_index(drop=True)
+    if "摘要" not in df.columns:
+        df["摘要"] = ""
     return df
 
 
@@ -45,7 +45,7 @@ title_col, btn_col = st.columns([4, 1])
 with title_col:
     st.title("📧 BTL Email Monitor Dashboard")
     st.caption(
-        f"資料來源:GAS 每小時自動從 fnsbackup@ibiney.io 抓取 → Google Sheet → 此頁面"
+        f"資料來源:GAS 每小時自動從 fnsbackup@ibiney.io 抓取 + Gemini 摘要 → Google Sheet → 此頁面"
         f" / 本頁快取 {CACHE_TTL // 60} 分鐘"
     )
 with btn_col:
@@ -63,7 +63,6 @@ except Exception as e:
     st.stop()
 
 
-# ── KPI 卡片 ──
 total = len(df)
 unread_cnt = int(df["優先級"].str.contains("未讀未回", na=False).sum())
 read_cnt = int(df["優先級"].str.contains("已讀未回", na=False).sum())
@@ -83,14 +82,12 @@ elif total == 0:
 st.divider()
 
 
-# ── 篩選器 ──
 fc1, fc2 = st.columns([1, 2])
 with fc1:
     show_tags = st.multiselect(
         "顯示包含以下狀態的郵件",
         options=["🔴 未讀未回", "🟡 已讀未回", "🔵 當日新進"],
         default=["🔴 未讀未回", "🟡 已讀未回", "🔵 當日新進"],
-        help="勾選的狀態任一符合即顯示(OR 邏輯)",
     )
 with fc2:
     keyword = st.text_input("主旨 / 寄件者搜尋(選填)", value="")
@@ -109,7 +106,6 @@ if keyword:
     ]
 
 
-# ── 依寄件者分組 + 視覺去重複 + 換欄位順序 + 清理寄件者 ──
 display_df = view_df.copy().reset_index(drop=True)
 
 if not display_df.empty:
@@ -138,16 +134,17 @@ for s in display_df["寄件者"]:
     prev_sender = s
 display_df["寄件者"] = deduped_senders
 
-display_df = display_df[["寄件者", "優先級", "主旨", "收信日期", "等待時長", "郵件連結"]]
 
-
-# ── 表格 ──
 st.subheader(f"📋 待處理清單  ({len(view_df)} 筆)")
+st.caption("💡 點選任一列 → 下方會展開該封信的英文摘要")
 
-st.dataframe(
+event = st.dataframe(
     display_df,
     width="stretch",
     hide_index=True,
+    on_select="rerun",
+    selection_mode="single-row",
+    column_order=["寄件者", "優先級", "主旨", "收信日期", "等待時長", "郵件連結"],
     column_config={
         "寄件者": st.column_config.TextColumn(width="medium"),
         "優先級": st.column_config.TextColumn(width="medium"),
@@ -160,8 +157,26 @@ st.dataframe(
             width="small",
             help="點擊跳轉至 Gmail(需以 fnsbackup@ibiney.io 登入)",
         ),
+        "摘要": None,
     },
 )
+
+selected_rows = event.selection.rows if event and event.selection else []
+if selected_rows:
+    idx = selected_rows[0]
+    row = display_df.iloc[idx]
+    summary_text = row.get("摘要", "")
+    subject = row.get("主旨", "")
+    link = row.get("郵件連結", "")
+
+    st.divider()
+    st.markdown(f"### 📄 {subject}")
+    if summary_text and str(summary_text).strip():
+        st.markdown(summary_text)
+    else:
+        st.info("此封信還沒有摘要 — 等下次 GAS 自動更新時 Gemini 會產生")
+    if link:
+        st.markdown(f"[🔗 在 Gmail 中開啟]({link})")
 
 
 st.caption(
