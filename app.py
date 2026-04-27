@@ -1,7 +1,6 @@
 # app.py
 # BTL Email Monitor Dashboard(Streamlit 版,讀取 Google Sheet)
 # 資料流:fnsbackup@ibiney.io → GAS(每小時)→ Google Sheet → 此頁面
-# 啟動指令(本機測試用):streamlit run app.py
 
 from datetime import datetime
 import pandas as pd
@@ -14,9 +13,7 @@ CSV_URL = (
     f"https://docs.google.com/spreadsheets/d/{SHEET_ID}"
     f"/gviz/tq?tqx=out:csv&sheet={SHEET_NAME}"
 )
-
-# 快取秒數(避免每次重新整理都打 Google,5 分鐘夠用)
-CACHE_TTL = 300
+CACHE_TTL = 300  # 5 分鐘
 
 
 # ── 頁面設定 ─────────────────────────────────────────────
@@ -32,8 +29,6 @@ st.set_page_config(
 def load_sheet():
     """從 Google Sheet 抓取最新待處理清單。"""
     df = pd.read_csv(CSV_URL)
-    # GAS 寫入的欄位順序:優先級、寄件者、主旨、收信日期、等待時長、郵件連結
-    # CSV 可能多帶到 H 欄(最後更新)和空白 G 欄,只取前 6 欄
     df = df.iloc[:, :6]
     df.columns = ["優先級", "寄件者", "主旨", "收信日期", "等待時長", "郵件連結"]
     df = df.dropna(subset=["優先級"]).reset_index(drop=True)
@@ -49,7 +44,7 @@ with title_col:
         f" / 本頁快取 {CACHE_TTL // 60} 分鐘"
     )
 with btn_col:
-    st.write("")  # 對齊用
+    st.write("")
     if st.button("🔄 立即重新整理", use_container_width=True):
         st.cache_data.clear()
         st.rerun()
@@ -67,18 +62,20 @@ except Exception as e:
     st.stop()
 
 
-# ── KPI 卡片 ────────────────────────────────────────────
+# ── KPI 卡片(三個獨立計數,可重疊) ────────────────────
 total = len(df)
-critical = int(df["優先級"].str.contains("CRITICAL", na=False).sum())
-new_count = int(df["優先級"].str.contains("NEW", na=False).sum())
+unread_cnt = int(df["優先級"].str.contains("未讀未回", na=False).sum())
+read_cnt = int(df["優先級"].str.contains("已讀未回", na=False).sum())
+today_cnt = int(df["優先級"].str.contains("當日新進", na=False).sum())
 
-c1, c2, c3 = st.columns(3)
+c1, c2, c3, c4 = st.columns(4)
 c1.metric("📨 待處理總數", total)
-c2.metric("🔴 緊急 CRITICAL", critical)
-c3.metric("🟡 新進 NEW", new_count)
+c2.metric("🔴 未讀未回", unread_cnt, help="客戶寄來但你還沒打開過")
+c3.metric("🟡 已讀未回", read_cnt, help="你看過但還沒回覆")
+c4.metric("🔵 當日新進", today_cnt, help="今日才到的新郵件(可能同時也是紅或黃)")
 
-if critical > 0:
-    st.warning(f"⚠️ 有 **{critical}** 封等待超過 24 小時,請優先處理")
+if unread_cnt > 0:
+    st.warning(f"⚠️ 有 **{unread_cnt}** 封還沒打開過,建議優先處理")
 elif total == 0:
     st.success("🎉 目前沒有待處理郵件,辛苦了")
 
@@ -88,15 +85,21 @@ st.divider()
 # ── 篩選器 ─────────────────────────────────────────────
 fc1, fc2 = st.columns([1, 2])
 with fc1:
-    show_pri = st.multiselect(
-        "顯示優先級",
-        options=["🔴 CRITICAL", "🟡 NEW"],
-        default=["🔴 CRITICAL", "🟡 NEW"],
+    show_tags = st.multiselect(
+        "顯示包含以下狀態的郵件",
+        options=["🔴 未讀未回", "🟡 已讀未回", "🔵 當日新進"],
+        default=["🔴 未讀未回", "🟡 已讀未回", "🔵 當日新進"],
+        help="勾選的狀態任一符合即顯示(OR 邏輯)",
     )
 with fc2:
     keyword = st.text_input("主旨 / 寄件者搜尋(選填)", value="")
 
-view_df = df[df["優先級"].isin(show_pri)].copy()
+if show_tags:
+    pattern = "|".join([t.split(" ")[1] for t in show_tags])
+    view_df = df[df["優先級"].str.contains(pattern, na=False)].copy()
+else:
+    view_df = df.iloc[0:0].copy()
+
 if keyword:
     kw = keyword.lower()
     view_df = view_df[
@@ -113,7 +116,7 @@ st.dataframe(
     width="stretch",
     hide_index=True,
     column_config={
-        "優先級": st.column_config.TextColumn(width="small"),
+        "優先級": st.column_config.TextColumn(width="medium"),
         "寄件者": st.column_config.TextColumn(width="medium"),
         "主旨": st.column_config.TextColumn(width="large"),
         "收信日期": st.column_config.TextColumn(width="small"),
