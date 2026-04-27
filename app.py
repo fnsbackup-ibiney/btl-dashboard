@@ -15,8 +15,6 @@ CSV_URL = (
 )
 CACHE_TTL = 300
 
-
-# ── 頁面設定 ─────────────────────────────────────────────
 st.set_page_config(
     page_title="BTL Email Monitor",
     page_icon="📧",
@@ -24,7 +22,6 @@ st.set_page_config(
 )
 
 
-# ── 資料讀取(快取) ─────────────────────────────────────
 @st.cache_data(ttl=CACHE_TTL, show_spinner="正在從 Google Sheet 讀取最新資料...")
 def load_sheet():
     df = pd.read_csv(CSV_URL)
@@ -34,7 +31,6 @@ def load_sheet():
     return df
 
 
-# ── 標題列 ───────────────────────────────────────────────
 title_col, btn_col = st.columns([4, 1])
 with title_col:
     st.title("📧 BTL Email Monitor Dashboard")
@@ -49,7 +45,6 @@ with btn_col:
         st.rerun()
 
 
-# ── 載入資料 ─────────────────────────────────────────────
 try:
     df = load_sheet()
 except Exception as e:
@@ -58,7 +53,7 @@ except Exception as e:
     st.stop()
 
 
-# ── KPI 卡片(三個獨立計數,可重疊) ────────────────────
+# ── KPI 卡片 ──
 total = len(df)
 unread_cnt = int(df["優先級"].str.contains("未讀未回", na=False).sum())
 read_cnt = int(df["優先級"].str.contains("已讀未回", na=False).sum())
@@ -78,7 +73,7 @@ elif total == 0:
 st.divider()
 
 
-# ── 篩選器 ─────────────────────────────────────────────
+# ── 篩選器 ──
 fc1, fc2 = st.columns([1, 2])
 with fc1:
     show_tags = st.multiselect(
@@ -104,12 +99,23 @@ if keyword:
     ]
 
 
-# ── 寄件者去重複顯示 ────────────────────────────────────
-# 同一寄件者連續多列時,只在第一列顯示「寄件者 (N)」,後續留空
-# N = 此寄件者在當前篩選後清單中的總封數
+# ── 依寄件者分組 + 視覺去重複 + 換欄位順序 ──
 display_df = view_df.copy().reset_index(drop=True)
-sender_counts = display_df["寄件者"].value_counts().to_dict()
 
+if not display_df.empty:
+    sender_first_pos = {}
+    for i, s in enumerate(display_df["寄件者"]):
+        if s not in sender_first_pos:
+            sender_first_pos[s] = i
+    display_df["_group_rank"] = display_df["寄件者"].map(sender_first_pos)
+    display_df = (
+        display_df
+        .sort_values("_group_rank", kind="stable")
+        .drop(columns=["_group_rank"])
+        .reset_index(drop=True)
+    )
+
+sender_counts = display_df["寄件者"].value_counts().to_dict()
 deduped_senders = []
 prev_sender = None
 for s in display_df["寄件者"]:
@@ -121,8 +127,11 @@ for s in display_df["寄件者"]:
     prev_sender = s
 display_df["寄件者"] = deduped_senders
 
+# 欄位順序:寄件者 → 優先級 → 主旨 → 收信日期 → 等待時長 → 郵件連結
+display_df = display_df[["寄件者", "優先級", "主旨", "收信日期", "等待時長", "郵件連結"]]
 
-# ── 表格 ───────────────────────────────────────────────
+
+# ── 表格 ──
 st.subheader(f"📋 待處理清單  ({len(view_df)} 筆)")
 
 st.dataframe(
@@ -130,8 +139,8 @@ st.dataframe(
     width="stretch",
     hide_index=True,
     column_config={
-        "優先級": st.column_config.TextColumn(width="medium"),
         "寄件者": st.column_config.TextColumn(width="medium"),
+        "優先級": st.column_config.TextColumn(width="medium"),
         "主旨": st.column_config.TextColumn(width="large"),
         "收信日期": st.column_config.TextColumn(width="small"),
         "等待時長": st.column_config.TextColumn(width="small"),
@@ -145,7 +154,6 @@ st.dataframe(
 )
 
 
-# ── 頁尾 ───────────────────────────────────────────────
 st.caption(
     f"頁面載入時間:{datetime.now().strftime('%Y-%m-%d %H:%M:%S')} / "
     f"如需查看最新狀態請按右上「🔄 立即重新整理」"
