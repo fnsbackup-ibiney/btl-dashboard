@@ -1,10 +1,20 @@
 # app.py
 # BTL Email Monitor Dashboard(Streamlit 版,讀取 Google Sheet)
-# 資料流:fnsbackup@ibiney.io → GAS(每小時)→ Google Sheet → 此頁面
 
+import re
 from datetime import datetime
 import pandas as pd
 import streamlit as st
+
+
+def clean_sender(s: str) -> str:
+    """把 'Name <email@domain>' 簡化成 'Name'。"""
+    if not s:
+        return s
+    s = re.sub(r"\s*<[^>]+>", "", str(s))
+    s = s.strip().strip('"').strip()
+    return s
+
 
 # ── 設定 ─────────────────────────────────────────────────
 SHEET_ID = "1N6cTXNPIQlmKrOzQqB22WoZ6qkvdh-u4ATl1WDmc_A0"
@@ -99,7 +109,7 @@ if keyword:
     ]
 
 
-# ── 依寄件者分組 + 視覺去重複 + 換欄位順序 ──
+# ── 依寄件者分組 + 視覺去重複 + 換欄位順序 + 清理寄件者 ──
 display_df = view_df.copy().reset_index(drop=True)
 
 if not display_df.empty:
@@ -123,11 +133,11 @@ for s in display_df["寄件者"]:
         deduped_senders.append("")
     else:
         n = sender_counts.get(s, 1)
-        deduped_senders.append(f"{s}  ({n})" if n > 1 else s)
+        cleaned = clean_sender(s)
+        deduped_senders.append(f"{cleaned}  ({n})" if n > 1 else cleaned)
     prev_sender = s
 display_df["寄件者"] = deduped_senders
 
-# 欄位順序:寄件者 → 優先級 → 主旨 → 收信日期 → 等待時長 → 郵件連結
 display_df = display_df[["寄件者", "優先級", "主旨", "收信日期", "等待時長", "郵件連結"]]
 
 
