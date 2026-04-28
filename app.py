@@ -171,23 +171,42 @@ if selected_client_label and not selected_client_label.startswith("全部"):
 st.divider()
 
 
+# 為兩個下拉選項加上「(數量)」
+tag_count_map = {
+    "🔴 未讀未回": unread_cnt,
+    "🟡 已讀未回": read_cnt,
+    "🔵 當日新進": today_cnt,
+}
+tag_options_with_count = [
+    f"{t} ({tag_count_map[t]})" for t in ["🔴 未讀未回", "🟡 已讀未回", "🔵 當日新進"]
+]
+dept_count_map = df["部門"].value_counts().to_dict()
+dept_options_with_count = [
+    f"{d} ({dept_count_map.get(d, 0)})" for d in ALL_DEPARTMENTS
+]
+
 fc1, fc2, fc3 = st.columns([1, 1, 2])
 with fc1:
-    show_tags = st.multiselect(
+    show_tags_labeled = st.multiselect(
         "顯示包含以下狀態的郵件(選填)",
-        options=["🔴 未讀未回", "🟡 已讀未回", "🔵 當日新進"],
+        options=tag_options_with_count,
         placeholder="不勾 = 顯示全部",
     )
 with fc2:
-    show_depts = st.multiselect(
+    show_depts_labeled = st.multiselect(
         "部門(選填)",
-        options=ALL_DEPARTMENTS,
+        options=dept_options_with_count,
         placeholder="不勾 = 顯示全部",
     )
 with fc3:
     keyword = st.text_input("主旨 / 寄件者搜尋(選填)", value="")
 
-# 兩個下拉都是「不勾 = 不過濾」(顯示全部)
+# 把尾端 " (N)" 拿掉,還原原本的關鍵字
+show_tags = [t.rsplit(" (", 1)[0] for t in show_tags_labeled]
+show_depts = [d.rsplit(" (", 1)[0] for d in show_depts_labeled]
+
+
+# 兩個篩選器都是「不勾 = 不過濾」
 if show_tags:
     pattern = "|".join([t.split(" ")[1] for t in show_tags])
     view_df = df[df["優先級"].str.contains(pattern, na=False)].copy()
