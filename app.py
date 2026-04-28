@@ -174,29 +174,28 @@ st.divider()
 fc1, fc2, fc3 = st.columns([1, 1, 2])
 with fc1:
     show_tags = st.multiselect(
-        "顯示包含以下狀態的郵件",
+        "顯示包含以下狀態的郵件(選填)",
         options=["🔴 未讀未回", "🟡 已讀未回", "🔵 當日新進"],
-        default=["🔴 未讀未回", "🟡 已讀未回", "🔵 當日新進"],
+        placeholder="不勾 = 顯示全部",
     )
 with fc2:
     show_depts = st.multiselect(
-        "部門",
+        "部門(選填)",
         options=ALL_DEPARTMENTS,
-        default=ALL_DEPARTMENTS,
+        placeholder="不勾 = 顯示全部",
     )
 with fc3:
     keyword = st.text_input("主旨 / 寄件者搜尋(選填)", value="")
 
+# 兩個下拉都是「不勾 = 不過濾」(顯示全部)
 if show_tags:
     pattern = "|".join([t.split(" ")[1] for t in show_tags])
     view_df = df[df["優先級"].str.contains(pattern, na=False)].copy()
 else:
-    view_df = df.iloc[0:0].copy()
+    view_df = df.copy()
 
 if show_depts:
     view_df = view_df[view_df["部門"].isin(show_depts)].copy()
-else:
-    view_df = view_df.iloc[0:0].copy()
 
 if selected_client_name:
     view_df = view_df[view_df["客戶"] == selected_client_name].copy()
