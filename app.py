@@ -1,5 +1,5 @@
 # app.py
-# BTL Email Monitor Dashboard(Streamlit 版,讀取 Google Sheet)
+# BTL Email Monitor Dashboard
 
 import re
 from datetime import datetime
@@ -99,14 +99,14 @@ st.set_page_config(page_title="BTL Email Monitor", page_icon="📧", layout="wid
 @st.cache_data(ttl=CACHE_TTL, show_spinner="正在從 Google Sheet 讀取最新資料...")
 def load_sheet():
     df = pd.read_csv(CSV_URL)
-    df = df.iloc[:, :7]
-    expected = ["優先級", "寄件者", "主旨", "收信日期", "等待時長", "郵件連結", "摘要"]
-    if df.shape[1] < 7:
-        df["摘要"] = ""
-    df.columns = expected[: df.shape[1]]
+    expected = ["優先級", "寄件者", "主旨", "收信日期", "等待時長", "郵件連結", "摘要", "信件內容"]
+    actual_cols = min(df.shape[1], len(expected))
+    df = df.iloc[:, :actual_cols].copy()
+    df.columns = expected[:actual_cols]
+    for col in expected:
+        if col not in df.columns:
+            df[col] = ""
     df = df.dropna(subset=["優先級"]).reset_index(drop=True)
-    if "摘要" not in df.columns:
-        df["摘要"] = ""
     df["部門"] = df["寄件者"].apply(get_department)
     df["客戶"] = df["寄件者"].apply(get_client)
     return df
@@ -171,7 +171,6 @@ if selected_client_label and not selected_client_label.startswith("全部"):
 st.divider()
 
 
-# 為兩個下拉選項加上「(數量)」
 tag_count_map = {
     "🔴 未讀未回": unread_cnt,
     "🟡 已讀未回": read_cnt,
@@ -201,12 +200,10 @@ with fc2:
 with fc3:
     keyword = st.text_input("主旨 / 寄件者搜尋(選填)", value="")
 
-# 把尾端 " (N)" 拿掉,還原原本的關鍵字
 show_tags = [t.rsplit(" (", 1)[0] for t in show_tags_labeled]
 show_depts = [d.rsplit(" (", 1)[0] for d in show_depts_labeled]
 
 
-# 兩個篩選器都是「不勾 = 不過濾」
 if show_tags:
     pattern = "|".join([t.split(" ")[1] for t in show_tags])
     view_df = df[df["優先級"].str.contains(pattern, na=False)].copy()
@@ -262,7 +259,7 @@ display_df["部門"] = deduped_depts
 
 
 st.subheader(f"📋 待處理清單  ({len(view_df)} 筆)")
-st.caption("💡 點選任一列 → 下方會展開該封信的英文摘要")
+st.caption("💡 點選任一列 → 下方會展開該封信的英文摘要 + 完整內容")
 
 event = st.dataframe(
     display_df,
@@ -286,6 +283,7 @@ event = st.dataframe(
         ),
         "客戶": None,
         "摘要": None,
+        "信件內容": None,
     },
 )
 
@@ -294,15 +292,33 @@ if selected_rows:
     idx = selected_rows[0]
     row = display_df.iloc[idx]
     summary_text = row.get("摘要", "")
+    body_text = row.get("信件內容", "")
     subject = row.get("主旨", "")
     link = row.get("郵件連結", "")
 
     st.divider()
     st.markdown(f"### 📄 {subject}")
-    if summary_text and str(summary_text).strip():
-        st.markdown(summary_text)
-    else:
-        st.info("此封信還沒有摘要 — 等下次 GAS 自動更新時 Gemini 會產生")
+
+    left_col, right_col = st.columns([1, 1])
+    with left_col:
+        st.markdown("**📝 AI 摘要**")
+        if summary_text and str(summary_text).strip():
+            st.markdown(summary_text)
+        else:
+            st.info("此封信還沒有摘要 — 等下次 GAS 自動更新時 Gemini 會產生")
+    with right_col:
+        st.markdown("**📧 信件內容(最後一封)**")
+        if body_text and str(body_text).strip():
+            st.text_area(
+                label="body",
+                value=str(body_text),
+                height=400,
+                disabled=True,
+                label_visibility="collapsed",
+            )
+        else:
+            st.info("尚無信件內容 — 等下次 GAS 自動更新即會抓到")
+
     if link:
         st.markdown(f"[🔗 在 Gmail 中開啟]({link})")
 
