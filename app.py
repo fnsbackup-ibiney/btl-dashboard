@@ -89,6 +89,18 @@ def clean_sender(s: str) -> str:
     return s
 
 
+def md_to_html(text: str) -> str:
+    """簡易 Markdown → HTML 轉換,讓黃色框內的格式能正確顯示。"""
+    if not text:
+        return ""
+    s = str(text)
+    # **粗體**
+    s = re.sub(r"\*\*(.+?)\*\*", r"<strong>\1</strong>", s)
+    # 換行轉 <br>
+    s = s.replace("\n", "<br>")
+    return s
+
+
 def save_edit_to_gas(msg_id: str, title: str, summary: str, actions: str):
     try:
         resp = requests.post(
@@ -132,7 +144,6 @@ def load_sheet():
             df[col] = ""
     df = df.dropna(subset=["優先級"]).reset_index(drop=True)
 
-    # 套用使用者編輯
     try:
         edits_df = pd.read_csv(USER_EDITS_CSV_URL)
         if not edits_df.empty and "msg_id" in edits_df.columns:
@@ -353,14 +364,14 @@ if selected_rows:
     st.divider()
     st.markdown(f"### 📄 {subject}")
 
-    # Action Items 黃色突出區塊
+    # Action Items 黃色突出區塊(渲染 markdown)
     if actions_text and actions_text.strip():
         st.markdown(
             f"""
 <div style="background-color:#FFF8E1;border-left:6px solid #FFB300;
-            padding:16px 20px;border-radius:6px;margin-bottom:20px;">
+            padding:18px 24px;border-radius:6px;margin-bottom:20px;">
 <h4 style="margin-top:0;color:#E65100;">🎯 你該做的事(優先看!)</h4>
-<div style="font-size:15px;line-height:1.7;">{actions_text}</div>
+<div style="font-size:15px;line-height:1.8;">{md_to_html(actions_text)}</div>
 </div>
             """,
             unsafe_allow_html=True,
@@ -368,7 +379,6 @@ if selected_rows:
     else:
         st.info("🎯 待辦事項尚未產生 — 等下次 GAS 自動更新")
 
-    # 雙欄:左可編輯摘要 / 右信件原文
     left_col, right_col = st.columns([1, 1])
 
     with left_col:
@@ -389,8 +399,9 @@ if selected_rows:
                 else:
                     ok, err = save_edit_to_gas(msg_id, new_title, new_summary, new_actions)
                     if ok:
-                        st.success("已儲存 ✅ 重新整理頁面就會看到")
+                        st.success("已儲存 ✅ 自動重新整理中...")
                         st.cache_data.clear()
+                        st.rerun()
                     else:
                         st.error(f"儲存失敗:{err}")
 
