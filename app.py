@@ -4,7 +4,12 @@
 import re
 from datetime import datetime
 import pandas as pd
+import requests
 import streamlit as st
+
+
+# GAS Web App 端點(用來把編輯後的標題/摘要寫回 Google Sheet)
+GAS_WEBAPP_URL = "https://script.google.com/macros/s/AKfycbxYxacAovh3YB5d4ReRjYJ_UGgFyJzD6aHRNmvxv0vqCWd5faeqkwd5D2YJjMk11zmO/exec"
 
 
 DEPARTMENT_MAP = {
@@ -85,6 +90,21 @@ def clean_sender(s: str) -> str:
     return s
 
 
+def save_edit_to_gas(msg_id: str, title: str, summary: str):
+    """把編輯後的標題/摘要 POST 到 GAS Web App,寫進 _UserEdits 工作表。"""
+    try:
+        resp = requests.post(
+            GAS_WEBAPP_URL,
+            json={"msgId": msg_id, "title": title, "summary": summary},
+            timeout=15,
+        )
+        if resp.ok:
+            return True, ""
+        return False, f"HTTP {resp.status_code}"
+    except Exception as e:
+        return False, str(e)
+
+
 SHEET_ID = "1N6cTXNPIQlmKrOzQqB22WoZ6qkvdh-u4ATl1WDmc_A0"
 SHEET_NAME = "Sheet1"
 CSV_URL = (
@@ -99,7 +119,7 @@ st.set_page_config(page_title="BTL Email Monitor", page_icon="📧", layout="wid
 @st.cache_data(ttl=CACHE_TTL, show_spinner="正在從 Google Sheet 讀取最新資料...")
 def load_sheet():
     df = pd.read_csv(CSV_URL)
-    expected = ["優先級", "寄件者", "主旨", "收信日期", "等待時長", "郵件連結", "摘要", "信件內容"]
+    expected = ["msg_id", "優先級", "寄件者", "主旨", "收信日期", "等待時長", "郵件連結", "摘要", "信件內容"]
     actual_cols = min(df.shape[1], len(expected))
     df = df.iloc[:, :actual_cols].copy()
     df.columns = expected[:actual_cols]
@@ -259,7 +279,7 @@ display_df["部門"] = deduped_depts
 
 
 st.subheader(f"📋 待處理清單  ({len(view_df)} 筆)")
-st.caption("💡 點選任一列 → 下方會展開該封信的英文摘要 + 完整內容")
+st.caption("💡 點選任一列 → 下方可編輯標題與摘要,儲存後跨次打開仍保留")
 
 event = st.dataframe(
     display_df,
@@ -281,6 +301,7 @@ event = st.dataframe(
             width="small",
             help="點擊跳轉至 Gmail(需以 fnsbackup@ibiney.io 登入)",
         ),
+        "msg_id": None,
         "客戶": None,
         "摘要": None,
         "信件內容": None,
@@ -291,33 +312,48 @@ selected_rows = event.selection.rows if event and event.selection else []
 if selected_rows:
     idx = selected_rows[0]
     row = display_df.iloc[idx]
-    summary_text = row.get("摘要", "")
-    body_text = row.get("信件內容", "")
-    subject = row.get("主旨", "")
-    link = row.get("郵件連結", "")
+    msg_id = str(row.get("msg_id", "") or "")
+    summary_text = str(row.get("摘要", "") or "")
+    body_text = str(row.get("信件內容", "") or "")
+    subject = str(row.get("主旨", "") or "")
+    link = str(row.get("郵件連結", "") or "")
 
     st.divider()
-    st.markdown(f"### 📄 {subject}")
 
     left_col, right_col = st.columns([1, 1])
+
     with left_col:
-        st.markdown("**📝 AI 摘要**")
-        if summary_text and str(summary_text).strip():
-            st.markdown(summary_text)
-        else:
-            st.info("此封信還沒有摘要 — 等下次 GAS 自動更新時 Gemini 會產生")
+        st.markdown("### ✏️ 可編輯區(改完按下方儲存)")
+        with st.form(key=f"edit_form_{msg_id}", clear_on_submit=False):
+            new_title = st.text_input("📄 主旨", value=subject)
+            new_summary = st.text_area(
+                "📝 AI 摘要", value=summary_text, height=280,
+                help="可手動修改,例如 Gemini 摘錯時"
+            )
+            saved = st.form_submit_button("💾 儲存修改", use_container_width=True)
+            if saved:
+                if not msg_id:
+                    st.error("缺少 msg_id,無法儲存(請先在 GAS 跑一次 refreshDashboard)")
+                else:
+                    ok, err = save_edit_to_gas(msg_id, new_title, new_summary)
+                    if ok:
+                        st.success("已儲存 ✅ 下次 GAS 自動更新時會把你的版本套用回 Sheet")
+                        st.cache_data.clear()
+                    else:
+                        st.error(f"儲存失敗:{err}")
+
     with right_col:
-        st.markdown("**📧 信件內容(最後一封)**")
-        if body_text and str(body_text).strip():
+        st.markdown("### 📧 信件內容(原文,僅供參考)")
+        if body_text and body_text.strip():
             st.text_area(
                 label="body",
-                value=str(body_text),
+                value=body_text,
                 height=400,
                 disabled=True,
                 label_visibility="collapsed",
             )
         else:
-            st.info("尚無信件內容 — 等下次 GAS 自動更新即會抓到")
+            st.info("尚無信件內容")
 
     if link:
         st.markdown(f"[🔗 在 Gmail 中開啟]({link})")
