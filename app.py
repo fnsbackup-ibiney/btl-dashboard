@@ -8,7 +8,6 @@ import requests
 import streamlit as st
 
 
-# GAS Web App 端點(用來把編輯後的標題/摘要寫回 Google Sheet)
 GAS_WEBAPP_URL = "https://script.google.com/macros/s/AKfycbxYxacAovh3YB5d4ReRjYJ_UGgFyJzD6aHRNmvxv0vqCWd5faeqkwd5D2YJjMk11zmO/exec"
 
 
@@ -91,7 +90,6 @@ def clean_sender(s: str) -> str:
 
 
 def save_edit_to_gas(msg_id: str, title: str, summary: str):
-    """把編輯後的標題/摘要 POST 到 GAS Web App,寫進 _UserEdits 工作表。"""
     try:
         resp = requests.post(
             GAS_WEBAPP_URL,
@@ -107,11 +105,16 @@ def save_edit_to_gas(msg_id: str, title: str, summary: str):
 
 SHEET_ID = "1N6cTXNPIQlmKrOzQqB22WoZ6qkvdh-u4ATl1WDmc_A0"
 SHEET_NAME = "Sheet1"
+USER_EDITS_SHEET = "_UserEdits"
 CSV_URL = (
     f"https://docs.google.com/spreadsheets/d/{SHEET_ID}"
     f"/gviz/tq?tqx=out:csv&sheet={SHEET_NAME}"
 )
-CACHE_TTL = 300
+USER_EDITS_CSV_URL = (
+    f"https://docs.google.com/spreadsheets/d/{SHEET_ID}"
+    f"/gviz/tq?tqx=out:csv&sheet={USER_EDITS_SHEET}"
+)
+CACHE_TTL = 60   # 編輯後快點看到效果,改 60 秒
 
 st.set_page_config(page_title="BTL Email Monitor", page_icon="📧", layout="wide")
 
@@ -127,6 +130,31 @@ def load_sheet():
         if col not in df.columns:
             df[col] = ""
     df = df.dropna(subset=["優先級"]).reset_index(drop=True)
+
+    # 套用使用者編輯(_UserEdits 工作表),即時覆蓋 Sheet1 的內容
+    try:
+        edits_df = pd.read_csv(USER_EDITS_CSV_URL)
+        if not edits_df.empty and "msg_id" in edits_df.columns:
+            edits_map = {}
+            for _, r in edits_df.iterrows():
+                mid = str(r.get("msg_id", "") or "").strip()
+                if not mid:
+                    continue
+                edits_map[mid] = {
+                    "title": str(r.get("title", "") or "").strip(),
+                    "summary": str(r.get("summary", "") or "").strip(),
+                }
+            for i in range(len(df)):
+                mid = str(df.at[i, "msg_id"] or "").strip()
+                if mid in edits_map:
+                    if edits_map[mid]["title"]:
+                        df.at[i, "主旨"] = edits_map[mid]["title"]
+                    if edits_map[mid]["summary"]:
+                        df.at[i, "摘要"] = edits_map[mid]["summary"]
+    except Exception as e:
+        # 沒有 _UserEdits 或暫時讀不到不影響主流程
+        pass
+
     df["部門"] = df["寄件者"].apply(get_department)
     df["客戶"] = df["寄件者"].apply(get_client)
     return df
@@ -137,7 +165,7 @@ with title_col:
     st.title("📧 BTL Email Monitor Dashboard")
     st.caption(
         f"資料來源:GAS 每小時自動從 fnsbackup@ibiney.io 抓取 + Gemini 摘要 → Google Sheet → 此頁面"
-        f" / 本頁快取 {CACHE_TTL // 60} 分鐘"
+        f" / 本頁快取 {CACHE_TTL} 秒"
     )
 with btn_col:
     st.write("")
@@ -279,7 +307,7 @@ display_df["部門"] = deduped_depts
 
 
 st.subheader(f"📋 待處理清單  ({len(view_df)} 筆)")
-st.caption("💡 點選任一列 → 下方可編輯標題與摘要,儲存後跨次打開仍保留")
+st.caption("💡 點選任一列 → 下方可編輯標題與摘要,儲存後會即時看到修改後的內容")
 
 event = st.dataframe(
     display_df,
@@ -333,11 +361,11 @@ if selected_rows:
             saved = st.form_submit_button("💾 儲存修改", use_container_width=True)
             if saved:
                 if not msg_id:
-                    st.error("缺少 msg_id,無法儲存(請先在 GAS 跑一次 refreshDashboard)")
+                    st.error("缺少 msg_id,無法儲存")
                 else:
                     ok, err = save_edit_to_gas(msg_id, new_title, new_summary)
                     if ok:
-                        st.success("已儲存 ✅ 下次 GAS 自動更新時會把你的版本套用回 Sheet")
+                        st.success("已儲存 ✅ 重新整理頁面就會看到")
                         st.cache_data.clear()
                     else:
                         st.error(f"儲存失敗:{err}")
