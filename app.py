@@ -90,13 +90,10 @@ def clean_sender(s: str) -> str:
 
 
 def md_to_html(text: str) -> str:
-    """簡易 Markdown → HTML 轉換,讓黃色框內的格式能正確顯示。"""
     if not text:
         return ""
     s = str(text)
-    # **粗體**
     s = re.sub(r"\*\*(.+?)\*\*", r"<strong>\1</strong>", s)
-    # 換行轉 <br>
     s = s.replace("\n", "<br>")
     return s
 
@@ -113,6 +110,22 @@ def save_edit_to_gas(msg_id: str, title: str, summary: str, actions: str):
         return False, f"HTTP {resp.status_code}"
     except Exception as e:
         return False, str(e)
+
+
+def _on_save_callback(msg_id_arg, title_key, summary_key, actions_key):
+    """Callback,儲存編輯後的內容到 GAS 並更新 session_state(讓黃色框即時刷新)"""
+    title = st.session_state.get(title_key, "")
+    summary = st.session_state.get(summary_key, "")
+    actions = st.session_state.get(actions_key, "")
+    ok, err = save_edit_to_gas(msg_id_arg, title, summary, actions)
+    if ok:
+        st.session_state[f"_saved_{msg_id_arg}"] = {
+            "title": title, "summary": summary, "actions": actions,
+        }
+        st.session_state["_save_msg"] = ("ok", "✅ 已即時儲存")
+        st.cache_data.clear()
+    else:
+        st.session_state["_save_msg"] = ("err", f"❌ 儲存失敗:{err}")
 
 
 SHEET_ID = "1N6cTXNPIQlmKrOzQqB22WoZ6qkvdh-u4ATl1WDmc_A0"
@@ -361,17 +374,31 @@ if selected_rows:
     subject = str(row.get("主旨", "") or "")
     link = str(row.get("郵件連結", "") or "")
 
-    st.divider()
-    st.markdown(f"### 📄 {subject}")
+    # 即時編輯顯示:若 session_state 有最新編輯就用,否則用 Sheet 來的
+    saved_edits = st.session_state.get(f"_saved_{msg_id}", {})
+    display_subject = saved_edits.get("title") or subject
+    display_summary = saved_edits.get("summary") or summary_text
+    display_actions = saved_edits.get("actions") or actions_text
 
-    # Action Items 黃色突出區塊(渲染 markdown)
-    if actions_text and actions_text.strip():
+    st.divider()
+    st.markdown(f"### 📄 {display_subject}")
+
+    # 顯示上次儲存的訊息(如果有)
+    save_msg = st.session_state.pop("_save_msg", None)
+    if save_msg:
+        if save_msg[0] == "ok":
+            st.success(save_msg[1])
+        else:
+            st.error(save_msg[1])
+
+    # Action Items 黃色突出區塊
+    if display_actions and display_actions.strip():
         st.markdown(
             f"""
 <div style="background-color:#FFF8E1;border-left:6px solid #FFB300;
             padding:18px 24px;border-radius:6px;margin-bottom:20px;">
 <h4 style="margin-top:0;color:#E65100;">🎯 你該做的事(優先看!)</h4>
-<div style="font-size:15px;line-height:1.8;">{md_to_html(actions_text)}</div>
+<div style="font-size:15px;line-height:1.8;">{md_to_html(display_actions)}</div>
 </div>
             """,
             unsafe_allow_html=True,
@@ -382,28 +409,22 @@ if selected_rows:
     left_col, right_col = st.columns([1, 1])
 
     with left_col:
-        st.markdown("### ✏️ 可編輯區(改完按下方儲存)")
+        st.markdown("### ✏️ 可編輯區(改完按下方儲存,即時生效不跳頁)")
+
+        title_key = f"_form_t_{msg_id}"
+        summary_key = f"_form_s_{msg_id}"
+        actions_key = f"_form_a_{msg_id}"
+
         with st.form(key=f"edit_form_{msg_id}", clear_on_submit=False):
-            new_title = st.text_input("📄 主旨", value=subject)
-            new_summary = st.text_area(
-                "📝 AI 摘要", value=summary_text, height=200,
+            st.text_input("📄 主旨", value=display_subject, key=title_key)
+            st.text_area("📝 AI 摘要", value=display_summary, height=200, key=summary_key)
+            st.text_area("🎯 待辦事項", value=display_actions, height=200, key=actions_key)
+            st.form_submit_button(
+                "💾 儲存修改",
+                use_container_width=True,
+                on_click=_on_save_callback,
+                args=(msg_id, title_key, summary_key, actions_key),
             )
-            new_actions = st.text_area(
-                "🎯 待辦事項", value=actions_text, height=200,
-                help="可手動修改。例:Gemini 抓錯重點時"
-            )
-            saved = st.form_submit_button("💾 儲存修改", use_container_width=True)
-            if saved:
-                if not msg_id:
-                    st.error("缺少 msg_id,無法儲存")
-                else:
-                    ok, err = save_edit_to_gas(msg_id, new_title, new_summary, new_actions)
-                    if ok:
-                        st.success("已儲存 ✅ 自動重新整理中...")
-                        st.cache_data.clear()
-                        st.rerun()
-                    else:
-                        st.error(f"儲存失敗:{err}")
 
     with right_col:
         st.markdown("### 📧 信件內容(原文,僅供參考)")
