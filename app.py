@@ -112,6 +112,15 @@ def save_edit_to_gas(msg_id: str, title: str, summary: str, actions: str):
         return False, str(e)
 
 
+def trigger_gas_refresh():
+    """通知 GAS 立刻重新跑一次 refreshDashboard,讓 Sheet 抓最新郵箱狀態。"""
+    try:
+        requests.post(GAS_WEBAPP_URL, json={"action": "refresh"}, timeout=300)
+        return True
+    except Exception:
+        return False
+
+
 SHEET_ID = "1N6cTXNPIQlmKrOzQqB22WoZ6qkvdh-u4ATl1WDmc_A0"
 SHEET_NAME = "Sheet1"
 USER_EDITS_SHEET = "_UserEdits"
@@ -173,7 +182,6 @@ def load_sheet():
 
 @st.fragment
 def render_email_detail(msg_id, subject, summary_text, actions_text, body_text, link):
-    """整個展開區用 fragment 包起來,儲存時只重畫這個區塊,不動表格。"""
     saved_edits = st.session_state.get(f"_saved_{msg_id}", {})
     display_subject = saved_edits.get("title") or subject
     display_summary = saved_edits.get("summary") or summary_text
@@ -258,6 +266,8 @@ with title_col:
 with btn_col:
     st.write("")
     if st.button("🔄 立即重新整理", use_container_width=True):
+        with st.spinner("正在從 Gmail 抓取最新狀態,需等 10–60 秒..."):
+            trigger_gas_refresh()
         st.cache_data.clear()
         st.rerun()
 
