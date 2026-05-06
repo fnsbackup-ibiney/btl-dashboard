@@ -1,9 +1,10 @@
 # app.py
-# BTL Email Monitor - Multi-user OAuth + AI Smart Title (clean short version)
+# BTL Email Monitor - Group same-topic emails with unified title
 
 import base64
 import re
 import urllib.parse
+from collections import Counter
 from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
 
@@ -148,6 +149,31 @@ def extract_theme(summary_text):
     if m:
         return m.group(1).strip().strip('"').strip("'")
     return ""
+
+
+def extract_topic_key(text):
+    """
+    從文字中抓「訂單編號 / 款號」,作為「同主題」配對的 key。
+    例:'Re: SKY 80025 sample' → 'SKY-80025'
+        'BRAX 06388 mockup'   → 'BRAX-06388'
+        'updated PI for #2317' → 'NUM-2317'
+        '客戶問候' → None
+    """
+    if not text:
+        return None
+    upper = str(text).upper()
+    # 主要模式:品牌前綴 + 4-6 位數字
+    m = re.search(
+        r"\b(SKY|BRAX|WH|YAN|BIN|FNS|BTL|FCL|HW|BX|FS|YT|YAN|MJ)[\s\-/]*(\d{4,6})\b",
+        upper,
+    )
+    if m:
+        return f"{m.group(1)}-{m.group(2)}"
+    # 備案:單獨的 5-6 位數字(避免 4 位被誤抓成年份)
+    m = re.search(r"\b(\d{5,6})\b", upper)
+    if m:
+        return f"NUM-{m.group(1)}"
+    return None
 
 
 def get_login_url():
@@ -328,12 +354,7 @@ def gemini_summary_and_actions(msg_id, subject, body):
     prompt = (
         "Analyze this business email and produce TWO sections in English. "
         "Use EXACTLY this format with [---] as separator (no extra text outside):\n\n"
-        "**Theme:** SHORT KEYWORD-STYLE TITLE, MAX 8 WORDS. "
-        "Focus on order/style number + main topic. NO articles (a/the), NO full sentences. "
-        "Examples (good): 'SKY 80025 size sample feedback', 'BRAX 06368 urgent delivery', "
-        "'WH/W26 mockup approval needed', 'YAN 90008 SMS order details'. "
-        "Examples (BAD - too long): 'Approval of revised graded patterns for SKY 80025', "
-        "'Customer asking about shipment status for the BRAX order'.\n"
+        "**Theme:** [a short clean title MAX 8 words, format: 'OrderNumber MainTopic']\n"
         "- [Key point 1]\n- [Key point 2]\n- [Key point 3]\n\n"
         "[---]\n\n"
         "**🎯 What you need to do:**\n"
@@ -408,6 +429,47 @@ def precompute_summaries(items):
     return out
 
 
+def compute_grouped_titles(items, summary_cache):
+    """
+    判定哪些信是「同主題」(透過訂單編號配對),產出每封信的最終顯示標題。
+
+    邏輯:
+      1. 每封信抽出訂單編號(從原主旨 + AI Theme 找)
+      2. 計數:有多少信用同一個訂單編號
+      3. 若 ≥ 2 → 該組共用一個統一標題(訂單編號)
+      4. 若 = 1 或 None → 保持原主旨
+    """
+    # Step 1:每封信的 topic key
+    topic_keys = {}
+    for it in items:
+        cached = summary_cache.get(it["msg_id"], {})
+        theme = cached.get("theme", "")
+        # 先看原主旨,沒抓到再看 AI theme
+        key = extract_topic_key(it["subject"]) or extract_topic_key(theme)
+        topic_keys[it["msg_id"]] = key
+
+    # Step 2:計數
+    key_counts = Counter(k for k in topic_keys.values() if k)
+
+    # Step 3:給每封信派標題
+    titles = {}
+    for it in items:
+        msg_id = it["msg_id"]
+        key = topic_keys[msg_id]
+        if key and key_counts[key] >= 2:
+            # 同主題的多封信 → 統一標題
+            if key.startswith("NUM-"):
+                titles[msg_id] = f"#{key[4:]} 相關信件"
+            else:
+                # 例如 SKY-80025 → "SKY 80025"
+                brand, num = key.split("-", 1)
+                titles[msg_id] = f"{brand} {num}"
+        else:
+            # 唯一主題或抓不到編號 → 保留原主旨
+            titles[msg_id] = it["subject"]
+    return titles, topic_keys, key_counts
+
+
 st.set_page_config(page_title="BTL Email Monitor", page_icon="📧", layout="wide")
 
 
@@ -441,7 +503,7 @@ def handle_oauth_callback():
 
 
 @st.fragment
-def render_email_detail(item, user_name, user_first_name, summary_cache):
+def render_email_detail(item, user_name, user_first_name, summary_cache, display_title):
     msg_id = item["msg_id"]
     subject = item["subject"]
     body = item["body"]
@@ -449,16 +511,15 @@ def render_email_detail(item, user_name, user_first_name, summary_cache):
     cached = summary_cache.get(msg_id, {})
     summary = cached.get("summary", "")
     actions = cached.get("actions", "")
-    ai_theme = cached.get("theme", "") or extract_theme(summary)
 
     saved = st.session_state.get(f"_saved_{msg_id}", {})
-    display_subject = saved.get("title") or (ai_theme if ai_theme else subject)
+    final_title = saved.get("title") or display_title
     display_summary = saved.get("summary") or summary
     display_actions = saved.get("actions") or actions
 
     st.divider()
-    st.markdown(f"### 📄 {display_subject}")
-    if subject and ai_theme and ai_theme != subject:
+    st.markdown(f"### 📄 {final_title}")
+    if subject and final_title != subject:
         st.caption(f"📨 原始主旨:{subject}")
 
     if display_actions and display_actions.strip():
@@ -478,7 +539,7 @@ def render_email_detail(item, user_name, user_first_name, summary_cache):
     with left_col:
         st.markdown("### ✏️ 可編輯區(改完按下方儲存,僅本次 session 有效)")
         with st.form(key=f"edit_{msg_id}", clear_on_submit=False):
-            new_title = st.text_input("📄 標題", value=display_subject)
+            new_title = st.text_input("📄 標題", value=final_title)
             new_summary = st.text_area("📝 AI 摘要", value=display_summary, height=200)
             new_actions = st.text_area("🎯 待辦事項", value=display_actions, height=200)
             if st.form_submit_button("💾 儲存(僅本次 session)", use_container_width=True):
@@ -556,24 +617,28 @@ def show_main_dashboard():
         return
 
     if "summary_cache_for_table" not in st.session_state:
-        with st.spinner(f"🤖 AI 正在整理 {len(items)} 封信的標題..."):
+        with st.spinner(f"🤖 AI 正在整理 {len(items)} 封信..."):
             st.session_state["summary_cache_for_table"] = precompute_summaries(items)
     summary_cache = st.session_state["summary_cache_for_table"]
+
+    # 分組計算每封信的最終顯示標題
+    grouped_titles, topic_keys, key_counts = compute_grouped_titles(items, summary_cache)
+
+    # 統計分組情況
+    grouped_count = sum(1 for it in items
+                        if topic_keys[it["msg_id"]]
+                        and key_counts[topic_keys[it["msg_id"]]] >= 2)
 
     rows = []
     for it in items:
         badges = ["🔴 未讀未回" if it["is_unread"] else "🟡 已讀未回"]
         if it["is_today"]:
             badges.append("🔵 當日新進")
-        cached = summary_cache.get(it["msg_id"], {})
-        ai_theme = cached.get("theme", "")
-        # 表格只顯示 AI 整理後的短標題;原主旨在展開區看
-        display_title = ai_theme if ai_theme else it["subject"]
         rows.append({
             "msg_id": it["msg_id"],
             "優先級": " / ".join(badges),
             "寄件者": it["from"],
-            "標題": display_title,
+            "標題": grouped_titles[it["msg_id"]],
             "收信日期": it["date"].strftime("%Y-%m-%d %H:%M"),
             "等待時長": format_age(it["age_hours"]),
             "郵件連結": f"https://mail.google.com/mail/u/0/#inbox/{it['msg_id']}",
@@ -597,6 +662,9 @@ def show_main_dashboard():
 
     if unread_cnt > 0:
         st.warning(f"⚠️ 有 **{unread_cnt}** 封還沒打開過,建議優先處理")
+
+    if grouped_count > 0:
+        st.info(f"🔗 偵測到 **{grouped_count}** 封信屬於同主題分組(共用統一標題)")
 
     st.markdown("##### 🏢 快速依客戶篩選")
     client_counts = df["客戶"].value_counts().to_dict()
@@ -664,7 +732,7 @@ def show_main_dashboard():
     view_df["部門"] = deduped_depts
 
     st.subheader(f"📋 待處理清單  ({len(view_df)} 筆)")
-    st.caption("💡 標題是 AI 整理後的短版,點任一列展開可看原主旨 + 摘要 + 待辦 + 信件原文 + AI 回信草稿")
+    st.caption("💡 同主題多封信會共用標題;單封信保留原主旨")
 
     event = st.dataframe(
         view_df,
@@ -677,7 +745,7 @@ def show_main_dashboard():
             "寄件者": st.column_config.TextColumn(width="medium"),
             "部門": st.column_config.TextColumn(width="medium"),
             "優先級": st.column_config.TextColumn(width="medium"),
-            "標題": st.column_config.TextColumn("標題(AI 整理)", width="large"),
+            "標題": st.column_config.TextColumn(width="large"),
             "收信日期": st.column_config.TextColumn(width="small"),
             "等待時長": st.column_config.TextColumn(width="small"),
             "郵件連結": st.column_config.LinkColumn(
@@ -691,7 +759,9 @@ def show_main_dashboard():
     if selected_rows:
         idx = selected_rows[0]
         item = view_df.iloc[idx]["_item"]
-        render_email_detail(item, user_name, user_first_name, summary_cache)
+        # 點開時要把該信的最終標題傳進去
+        display_title_for_detail = grouped_titles[item["msg_id"]]
+        render_email_detail(item, user_name, user_first_name, summary_cache, display_title_for_detail)
 
     st.caption(f"頁面載入時間:{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
 
