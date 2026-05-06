@@ -1,24 +1,19 @@
 # app.py
-# BTL Email Monitor Dashboard - Multi-user version with Google OAuth
-# Each user logs in with their own Gmail and sees their own pending emails.
+# BTL Email Monitor - Multi-user with Google OAuth (manual flow, no PKCE)
 
 import base64
-import hashlib
-import json
 import re
-import time
+import urllib.parse
 from datetime import datetime, timezone
-from email.utils import parseaddr, parsedate_to_datetime
+from email.utils import parsedate_to_datetime
 
 import pandas as pd
 import requests
 import streamlit as st
-from google_auth_oauthlib.flow import Flow
 from google.oauth2.credentials import Credentials
 from googleapiclient.discovery import build
 
 
-# ── Config from Streamlit Secrets ──────────────────────
 CLIENT_ID = st.secrets["GOOGLE_OAUTH_CLIENT_ID"]
 CLIENT_SECRET = st.secrets["GOOGLE_OAUTH_CLIENT_SECRET"]
 REDIRECT_URI = st.secrets["GOOGLE_OAUTH_REDIRECT_URI"]
@@ -45,7 +40,6 @@ SEARCH_DAYS = 7
 BODY_MAX_CHARS = 3000
 
 
-# ── Department & Client maps(同單人版)─────────────
 DEPARTMENT_MAP = {
     "a.krumme@fuchsschmitt.de": "🔥 EXECUTIVE",
     "m.haberkorn@fuchsschmitt.de": "🔥 EXECUTIVE",
@@ -89,7 +83,6 @@ CLIENT_DISPLAY_MAP = {
 }
 
 
-# ── 工具函式 ───────────────────────────────────────
 def extract_email(s):
     if not s:
         return ""
@@ -148,51 +141,50 @@ def format_age(hours):
     return f"{days} 天" if rem == 0 else f"{days} 天 {rem} 小時"
 
 
-# ── OAuth 登入流程 ────────────────────────────────
-def build_oauth_flow():
-    return Flow.from_client_config(
-        {
-            "web": {
-                "client_id": CLIENT_ID,
-                "client_secret": CLIENT_SECRET,
-                "auth_uri": "https://accounts.google.com/o/oauth2/auth",
-                "token_uri": "https://oauth2.googleapis.com/token",
-                "redirect_uris": [REDIRECT_URI],
-            }
-        },
-        scopes=OAUTH_SCOPES,
-        redirect_uri=REDIRECT_URI,
-    )
-
-
+# ── 純手寫 OAuth(不用 google_auth_oauthlib,避免 PKCE 狀態問題)──
 def get_login_url():
-    flow = build_oauth_flow()
-    auth_url, _ = flow.authorization_url(
-        access_type="offline",
-        include_granted_scopes="true",
-        prompt="consent",
-    )
-    return auth_url
+    params = {
+        "client_id": CLIENT_ID,
+        "redirect_uri": REDIRECT_URI,
+        "response_type": "code",
+        "scope": " ".join(OAUTH_SCOPES),
+        "access_type": "offline",
+        "include_granted_scopes": "true",
+        "prompt": "consent",
+    }
+    return f"https://accounts.google.com/o/oauth2/v2/auth?{urllib.parse.urlencode(params)}"
 
 
 def exchange_code_for_token(code):
-    flow = build_oauth_flow()
-    flow.fetch_token(code=code)
-    creds = flow.credentials
-    # 取得使用者資訊
+    resp = requests.post(
+        "https://oauth2.googleapis.com/token",
+        data={
+            "code": code,
+            "client_id": CLIENT_ID,
+            "client_secret": CLIENT_SECRET,
+            "redirect_uri": REDIRECT_URI,
+            "grant_type": "authorization_code",
+        },
+        timeout=15,
+    )
+    if not resp.ok:
+        raise Exception(f"Token exchange failed: {resp.text}")
+    token_data = resp.json()
+
     user_info = requests.get(
         "https://www.googleapis.com/oauth2/v1/userinfo",
-        headers={"Authorization": f"Bearer {creds.token}"},
+        headers={"Authorization": f"Bearer {token_data['access_token']}"},
         timeout=10,
     ).json()
+
     return {
         "creds": {
-            "token": creds.token,
-            "refresh_token": creds.refresh_token,
-            "token_uri": creds.token_uri,
-            "client_id": creds.client_id,
-            "client_secret": creds.client_secret,
-            "scopes": creds.scopes,
+            "token": token_data["access_token"],
+            "refresh_token": token_data.get("refresh_token"),
+            "token_uri": "https://oauth2.googleapis.com/token",
+            "client_id": CLIENT_ID,
+            "client_secret": CLIENT_SECRET,
+            "scopes": OAUTH_SCOPES,
         },
         "email": user_info.get("email", ""),
         "name": user_info.get("name", ""),
@@ -211,7 +203,6 @@ def credentials_from_dict(creds_dict):
     )
 
 
-# ── Gmail 抓信(每使用者各自抓)───────────────────
 def build_gmail_query():
     kw_clause = " OR ".join([f"subject:{k}" for k in BUSINESS_KEYWORDS])
     noise_clause = " ".join([f"-from:{d}" for d in NOISE_DOMAINS])
@@ -219,42 +210,28 @@ def build_gmail_query():
 
 
 def parse_gmail_message(service, msg_id):
-    """抓單一 Gmail message,回傳 dict。"""
     msg = service.users().messages().get(
         userId="me", id=msg_id, format="full"
     ).execute()
-
     headers = {h["name"]: h["value"] for h in msg.get("payload", {}).get("headers", [])}
     subject = headers.get("Subject", "")
     from_raw = headers.get("From", "")
     date_str = headers.get("Date", "")
-
-    # 解析日期
     try:
         msg_date = parsedate_to_datetime(date_str)
         if msg_date.tzinfo is None:
             msg_date = msg_date.replace(tzinfo=timezone.utc)
     except Exception:
         msg_date = datetime.now(timezone.utc)
-
-    # 抓 plain text body
     body = extract_plain_body(msg.get("payload", {}))
-
-    # 是否未讀
     is_unread = "UNREAD" in msg.get("labelIds", [])
-
     return {
-        "id": msg_id,
-        "subject": subject,
-        "from": from_raw,
-        "date": msg_date,
-        "body": body,
-        "is_unread": is_unread,
+        "id": msg_id, "subject": subject, "from": from_raw,
+        "date": msg_date, "body": body, "is_unread": is_unread,
     }
 
 
 def extract_plain_body(payload):
-    """遞迴從 Gmail payload 取出 plain text body。"""
     if not payload:
         return ""
     mime_type = payload.get("mimeType", "")
@@ -273,14 +250,8 @@ def extract_plain_body(payload):
 
 
 def fetch_pending_emails(creds_dict, current_user_email):
-    """
-    抓使用者 Gmail 中符合條件的 thread,套用 B 邏輯:
-    - 找 thread 最後一封外部信
-    - 檢查使用者本人之後有沒有回(若有,跳過)
-    """
     creds = credentials_from_dict(creds_dict)
     service = build("gmail", "v1", credentials=creds, cache_discovery=False)
-
     query = build_gmail_query()
     threads_resp = service.users().threads().list(
         userId="me", q=query, maxResults=200
@@ -299,37 +270,32 @@ def fetch_pending_emails(creds_dict, current_user_email):
         if not messages_meta:
             continue
 
-        # 找最後一封外部信
         last_external_idx = -1
         for i in range(len(messages_meta) - 1, -1, -1):
-            from_header = next(
+            from_h = next(
                 (h["value"] for h in messages_meta[i].get("payload", {}).get("headers", [])
-                 if h["name"] == "From"),
-                "",
+                 if h["name"] == "From"), "",
             )
-            from_email = extract_email(from_header)
+            from_email = extract_email(from_h)
             if from_email and not is_internal(from_email):
                 last_external_idx = i
                 break
         if last_external_idx == -1:
             continue
 
-        # 檢查使用者(登入者本人)之後有沒有回
         user_replied = False
         for j in range(last_external_idx + 1, len(messages_meta)):
-            from_header = next(
+            from_h = next(
                 (h["value"] for h in messages_meta[j].get("payload", {}).get("headers", [])
-                 if h["name"] == "From"),
-                "",
+                 if h["name"] == "From"), "",
             )
-            from_email = extract_email(from_header)
+            from_email = extract_email(from_h)
             if from_email == current_user_email.lower():
                 user_replied = True
                 break
         if user_replied:
             continue
 
-        # 取最後外部信完整內容
         last_msg = parse_gmail_message(service, messages_meta[last_external_idx]["id"])
         last_email = extract_email(last_msg["from"])
         if is_noise_domain(last_email):
@@ -339,28 +305,20 @@ def fetch_pending_emails(creds_dict, current_user_email):
         age_hours = int((now - last_msg["date"]).total_seconds() // 3600)
 
         items.append({
-            "msg_id": last_msg["id"],
-            "subject": last_msg["subject"],
-            "from": last_msg["from"],
-            "date": last_msg["date"],
-            "body": last_msg["body"],
-            "is_unread": last_msg["is_unread"],
-            "is_today": is_today,
-            "age_hours": age_hours,
+            "msg_id": last_msg["id"], "subject": last_msg["subject"],
+            "from": last_msg["from"], "date": last_msg["date"],
+            "body": last_msg["body"], "is_unread": last_msg["is_unread"],
+            "is_today": is_today, "age_hours": age_hours,
         })
 
     items.sort(key=lambda x: (
-        not x["is_unread"],
-        not x["is_today"],
-        -x["age_hours"],
+        not x["is_unread"], not x["is_today"], -x["age_hours"],
     ))
     return items
 
 
-# ── Gemini 摘要 + 待辦事項 ─────────────────────────
 @st.cache_data(ttl=86400, show_spinner=False)
 def gemini_summary_and_actions(msg_id, subject, body):
-    """以 msg_id 做快取 key。每使用者各自 session 不衝突。"""
     prompt = (
         "Analyze this business email and produce TWO sections in English. "
         "Use EXACTLY this format with [---] as separator (no extra text outside):\n\n"
@@ -376,14 +334,12 @@ def gemini_summary_and_actions(msg_id, subject, body):
         "**📌 Context:** [one line of business context]\n\n"
         f"Email Subject: {subject}\n\nEmail Body:\n{body[:BODY_MAX_CHARS]}"
     )
-
     resp = requests.post(
         GEMINI_API_URL,
         json={
             "contents": [{"parts": [{"text": prompt}]}],
             "generationConfig": {
-                "temperature": 0.3,
-                "maxOutputTokens": 1500,
+                "temperature": 0.3, "maxOutputTokens": 1500,
                 "thinkingConfig": {"thinkingBudget": 0},
             },
         },
@@ -391,9 +347,8 @@ def gemini_summary_and_actions(msg_id, subject, body):
     )
     if not resp.ok:
         return "(摘要產生失敗)", ""
-    data = resp.json()
     try:
-        parts = data["candidates"][0]["content"]["parts"]
+        parts = resp.json()["candidates"][0]["content"]["parts"]
         full_text = "".join(p.get("text", "") for p in parts).strip()
         sections = full_text.split("[---]")
         return sections[0].strip(), (sections[1].strip() if len(sections) > 1 else "")
@@ -419,8 +374,7 @@ def gemini_reply_draft(msg_id, subject, body, actions, sender_name, user_first_n
         json={
             "contents": [{"parts": [{"text": prompt}]}],
             "generationConfig": {
-                "temperature": 0.5,
-                "maxOutputTokens": 800,
+                "temperature": 0.5, "maxOutputTokens": 800,
                 "thinkingConfig": {"thinkingBudget": 0},
             },
         },
@@ -435,7 +389,6 @@ def gemini_reply_draft(msg_id, subject, body, actions, sender_name, user_first_n
         return None
 
 
-# ── Streamlit App 主流程 ──────────────────────────
 st.set_page_config(page_title="BTL Email Monitor", page_icon="📧", layout="wide")
 
 
@@ -452,13 +405,11 @@ def show_login_page():
 
 
 def handle_oauth_callback():
-    """處理從 Google 回來的 ?code=... query param。"""
     qp = st.query_params
     if "code" not in qp:
         return False
     try:
         result = exchange_code_for_token(qp["code"])
-        # 限制只允許 ibiney.io 使用者
         if not result["email"].lower().endswith("@" + INTERNAL_DOMAIN):
             st.error(f"此系統僅限 @{INTERNAL_DOMAIN} 同事使用。你的帳號:{result['email']}")
             st.stop()
@@ -476,11 +427,9 @@ def render_email_detail(item, user_name, user_first_name):
     subject = item["subject"]
     body = item["body"]
 
-    # session-state 編輯覆蓋
     saved = st.session_state.get(f"_saved_{msg_id}", {})
     display_subject = saved.get("title") or subject
 
-    # 摘要 / 待辦(快取 24h,因為每封信 msg_id 唯一)
     with st.spinner("AI 摘要中..."):
         summary, actions = gemini_summary_and_actions(msg_id, subject, body)
     display_summary = saved.get("summary") or summary
@@ -511,9 +460,7 @@ def render_email_detail(item, user_name, user_first_name):
             new_actions = st.text_area("🎯 待辦事項", value=display_actions, height=200)
             if st.form_submit_button("💾 儲存(僅本次 session)", use_container_width=True):
                 st.session_state[f"_saved_{msg_id}"] = {
-                    "title": new_title,
-                    "summary": new_summary,
-                    "actions": new_actions,
+                    "title": new_title, "summary": new_summary, "actions": new_actions,
                 }
                 st.rerun(scope="fragment")
 
@@ -526,7 +473,6 @@ def render_email_detail(item, user_name, user_first_name):
     gmail_link = f"https://mail.google.com/mail/u/0/#inbox/{msg_id}"
     st.markdown(f"[🔗 在 Gmail 中開啟原信]({gmail_link})")
 
-    # AI 回信草稿
     st.divider()
     st.markdown("### ✍️ AI 一鍵產生回信草稿")
     draft_key = f"_draft_{msg_id}"
@@ -542,11 +488,8 @@ def render_email_detail(item, user_name, user_first_name):
     if draft_key in st.session_state:
         st.markdown("##### 📝 建議回信")
         st.text_area(
-            "draft",
-            value=st.session_state[draft_key],
-            height=300,
-            label_visibility="collapsed",
-            key=f"d_{msg_id}",
+            "draft", value=st.session_state[draft_key], height=300,
+            label_visibility="collapsed", key=f"d_{msg_id}",
         )
         st.caption("✂️ 滑鼠選取 → ⌘+C 複製 → 開 Gmail Reply → ⌘+V 貼上")
 
@@ -557,7 +500,6 @@ def show_main_dashboard():
     user_name = user.get("name") or user_email
     user_first_name = user_name.split()[0] if user_name else "Me"
 
-    # ── 標題列 ──
     title_col, user_col = st.columns([4, 1])
     with title_col:
         st.title("📧 BTL Email Monitor")
@@ -572,7 +514,6 @@ def show_main_dashboard():
             st.query_params.clear()
             st.rerun()
 
-    # ── 抓取郵件 ──
     with st.spinner("📬 正在從你的 Gmail 抓取待回信件(30-90 秒)..."):
         try:
             items = fetch_pending_emails(user["creds"], user_email)
@@ -585,7 +526,6 @@ def show_main_dashboard():
         st.success("🎉 你的 Gmail 中目前沒有待回客戶信件,辛苦了!")
         return
 
-    # ── 轉成 DataFrame ──
     rows = []
     for it in items:
         badges = ["🔴 未讀未回" if it["is_unread"] else "🟡 已讀未回"]
@@ -606,7 +546,6 @@ def show_main_dashboard():
     df["部門"] = df["寄件者"].apply(get_department)
     df["客戶"] = df["寄件者"].apply(get_client)
 
-    # ── KPI 卡 ──
     total = len(df)
     unread_cnt = int(df["優先級"].str.contains("未讀未回", na=False).sum())
     read_cnt = int(df["優先級"].str.contains("已讀未回", na=False).sum())
@@ -621,7 +560,6 @@ def show_main_dashboard():
     if unread_cnt > 0:
         st.warning(f"⚠️ 有 **{unread_cnt}** 封還沒打開過,建議優先處理")
 
-    # ── 客戶 pills ──
     st.markdown("##### 🏢 快速依客戶篩選")
     client_counts = df["客戶"].value_counts().to_dict()
     client_options = [f"全部 ({total})"] + [
@@ -637,13 +575,10 @@ def show_main_dashboard():
 
     st.divider()
 
-    # ── 篩選器 ──
     fc1, fc2, fc3 = st.columns([1, 1, 2])
     with fc1:
         tag_count_map = {
-            "🔴 未讀未回": unread_cnt,
-            "🟡 已讀未回": read_cnt,
-            "🔵 當日新進": today_cnt,
+            "🔴 未讀未回": unread_cnt, "🟡 已讀未回": read_cnt, "🔵 當日新進": today_cnt,
         }
         tag_opts = [f"{t} ({tag_count_map[t]})" for t in ["🔴 未讀未回", "🟡 已讀未回", "🔵 當日新進"]]
         show_tags_l = st.multiselect("狀態(選填)", tag_opts, placeholder="不勾 = 全部")
@@ -673,7 +608,6 @@ def show_main_dashboard():
         ]
     view_df = view_df.reset_index(drop=True)
 
-    # ── 寄件者去重複 ──
     sender_counts = view_df["寄件者"].value_counts().to_dict()
     deduped = []
     prev = None
@@ -724,7 +658,6 @@ def show_main_dashboard():
     st.caption(f"頁面載入時間:{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
 
 
-# ── Entry ──────────────────────────────────────
 def main():
     handle_oauth_callback()
     if "user" not in st.session_state:
