@@ -98,6 +98,20 @@ def md_to_html(text: str) -> str:
     return s
 
 
+def extract_order_codes(subject: str):
+    """從主旨抓 4-6 位數的款號 / 訂單編號(去除年份等雜訊)。"""
+    if not subject:
+        return []
+    codes = set()
+    for m in re.finditer(r"\b(\d{4,6})\b", str(subject)):
+        n = m.group(1)
+        # 排除常見年份(2024-2030)
+        if n in ("2024", "2025", "2026", "2027", "2028", "2029", "2030"):
+            continue
+        codes.add(n)
+    return list(codes)
+
+
 def save_edit_to_gas(msg_id: str, title: str, summary: str, actions: str):
     try:
         resp = requests.post(
@@ -113,7 +127,6 @@ def save_edit_to_gas(msg_id: str, title: str, summary: str, actions: str):
 
 
 def trigger_gas_refresh():
-    """通知 GAS 立刻重新跑一次 refreshDashboard,讓 Sheet 抓最新郵箱狀態。"""
     try:
         requests.post(GAS_WEBAPP_URL, json={"action": "refresh"}, timeout=300)
         return True
@@ -215,7 +228,6 @@ def render_email_detail(msg_id, subject, summary_text, actions_text, body_text, 
 
     with left_col:
         st.markdown("### ✏️ 可編輯區(改完按下方儲存,即時生效)")
-
         title_key = f"_form_t_{msg_id}"
         summary_key = f"_form_s_{msg_id}"
         actions_key = f"_form_a_{msg_id}"
@@ -297,6 +309,7 @@ elif total == 0:
     st.success("🎉 目前沒有待處理郵件,辛苦了")
 
 
+# ── 客戶篩選 ──
 st.markdown("##### 🏢 快速依客戶篩選")
 client_counts = df["客戶"].value_counts().to_dict()
 client_options = [f"全部 ({total})"] + [
@@ -312,6 +325,27 @@ selected_client_label = st.pills(
 selected_client_name = None
 if selected_client_label and not selected_client_label.startswith("全部"):
     selected_client_name = selected_client_label.rsplit(" (", 1)[0]
+
+
+# ── 訂單/款號篩選(NEW) ──
+st.markdown("##### 🔢 快速依訂單 / 款號篩選")
+code_freq = {}
+for s in df["主旨"].dropna():
+    for code in extract_order_codes(s):
+        code_freq[code] = code_freq.get(code, 0) + 1
+top_codes = sorted(code_freq.items(), key=lambda x: -x[1])[:15]
+code_options = ["全部"] + [f"{c} ({n})" for c, n in top_codes]
+selected_code_label = st.pills(
+    "訂單/款號",
+    code_options,
+    default="全部",
+    label_visibility="collapsed",
+    key="order_code_pills",
+)
+
+selected_code = None
+if selected_code_label and not selected_code_label.startswith("全部"):
+    selected_code = selected_code_label.rsplit(" (", 1)[0]
 
 
 st.divider()
@@ -361,6 +395,11 @@ if show_depts:
 
 if selected_client_name:
     view_df = view_df[view_df["客戶"] == selected_client_name].copy()
+
+if selected_code:
+    view_df = view_df[
+        view_df["主旨"].astype(str).str.contains(selected_code, regex=False, na=False)
+    ].copy()
 
 if keyword:
     kw = keyword.lower()
