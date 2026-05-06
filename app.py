@@ -121,7 +121,6 @@ def trigger_gas_refresh():
 
 
 def get_reply_draft(msg_id: str):
-    """請 GAS 用 Gemini 產生英文回信草稿。"""
     try:
         resp = requests.post(
             GAS_WEBAPP_URL,
@@ -155,6 +154,16 @@ USER_EDITS_CSV_URL = (
 CACHE_TTL = 60
 
 st.set_page_config(page_title="BTL Email Monitor", page_icon="📧", layout="wide")
+
+
+# ── 首次載入時自動觸發 GAS 抓 Gmail ──
+# 瀏覽器 Cmd+R 刷新會視為新 session,所以每次刷新會重新抓
+# 同一 session 內反覆操作不會重複觸發,避免浪費
+if "_session_initial_refresh" not in st.session_state:
+    st.session_state["_session_initial_refresh"] = True
+    with st.spinner("⏳ 首次載入,正在從 Gmail 抓最新狀態(10-30 秒,只發生一次)..."):
+        trigger_gas_refresh()
+    st.cache_data.clear()
 
 
 @st.cache_data(ttl=CACHE_TTL, show_spinner="正在從 Google Sheet 讀取最新資料...")
@@ -274,7 +283,6 @@ def render_email_detail(msg_id, subject, summary_text, actions_text, body_text, 
     if link:
         st.markdown(f"[🔗 在 Gmail 中開啟原信]({link})")
 
-    # ── AI 回信草稿 ──────────────────────────────────
     st.divider()
     st.markdown("### ✍️ AI 一鍵產生回信草稿")
 
@@ -304,8 +312,7 @@ title_col, btn_col = st.columns([4, 1])
 with title_col:
     st.title("📧 BTL Email Monitor Dashboard")
     st.caption(
-        f"資料來源:GAS 每小時自動從 fnsbackup@ibiney.io 抓取 + Gemini 摘要 → Google Sheet → 此頁面"
-        f" / 本頁快取 {CACHE_TTL} 秒"
+        f"資料來源:GAS 每小時自動 + 每次刷新自動觸發 → Google Sheet → 此頁面"
     )
 with btn_col:
     st.write("")
