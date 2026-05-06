@@ -1,5 +1,5 @@
 # app.py
-# BTL Email Monitor - Multi-user with Google OAuth (manual flow, no PKCE)
+# BTL Email Monitor - Multi-user with Google OAuth (cached fetch)
 
 import base64
 import re
@@ -141,7 +141,6 @@ def format_age(hours):
     return f"{days} 天" if rem == 0 else f"{days} 天 {rem} 小時"
 
 
-# ── 純手寫 OAuth(不用 google_auth_oauthlib,避免 PKCE 狀態問題)──
 def get_login_url():
     params = {
         "client_id": CLIENT_ID,
@@ -170,13 +169,11 @@ def exchange_code_for_token(code):
     if not resp.ok:
         raise Exception(f"Token exchange failed: {resp.text}")
     token_data = resp.json()
-
     user_info = requests.get(
         "https://www.googleapis.com/oauth2/v1/userinfo",
         headers={"Authorization": f"Bearer {token_data['access_token']}"},
         timeout=10,
     ).json()
-
     return {
         "creds": {
             "token": token_data["access_token"],
@@ -507,6 +504,7 @@ def show_main_dashboard():
     with user_col:
         st.write("")
         if st.button("🔄 重新抓取", use_container_width=True):
+            st.session_state.pop("pending_items", None)
             st.cache_data.clear()
             st.rerun()
         if st.button("🚪 登出", use_container_width=True):
@@ -514,13 +512,17 @@ def show_main_dashboard():
             st.query_params.clear()
             st.rerun()
 
-    with st.spinner("📬 正在從你的 Gmail 抓取待回信件(30-90 秒)..."):
-        try:
-            items = fetch_pending_emails(user["creds"], user_email)
-        except Exception as e:
-            st.error(f"抓取 Gmail 失敗:{e}")
-            st.info("可能是 token 過期,請登出重新登入。")
-            st.stop()
+    if "pending_items" not in st.session_state:
+        with st.spinner("📬 正在從你的 Gmail 抓取待回信件(30-90 秒,只發生一次)..."):
+            try:
+                st.session_state["pending_items"] = fetch_pending_emails(
+                    user["creds"], user_email
+                )
+            except Exception as e:
+                st.error(f"抓取 Gmail 失敗:{e}")
+                st.info("可能是 token 過期,請登出重新登入。")
+                st.stop()
+    items = st.session_state["pending_items"]
 
     if not items:
         st.success("🎉 你的 Gmail 中目前沒有待回客戶信件,辛苦了!")
