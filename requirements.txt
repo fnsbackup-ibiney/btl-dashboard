@@ -1,3 +1,7 @@
-streamlit>=1.30
+streamlit>=1.32
 pandas>=2.0
-openpyxl>=3.1
+requests>=2.31
+google-auth>=2.27
+google-auth-oauthlib>=1.2
+google-auth-httplib2>=0.2
+google-api-python-client>=2.118
