@@ -120,6 +120,27 @@ def trigger_gas_refresh():
         return False
 
 
+def get_reply_draft(msg_id: str):
+    """請 GAS 用 Gemini 產生英文回信草稿。"""
+    try:
+        resp = requests.post(
+            GAS_WEBAPP_URL,
+            json={"action": "draft_reply", "msgId": msg_id},
+            timeout=90,
+        )
+        if not resp.ok:
+            return None, f"HTTP {resp.status_code}"
+        try:
+            data = resp.json()
+        except ValueError:
+            return None, "Response not JSON"
+        if data.get("error"):
+            return None, str(data["error"])
+        return data.get("draft", ""), None
+    except Exception as e:
+        return None, str(e)
+
+
 SHEET_ID = "1N6cTXNPIQlmKrOzQqB22WoZ6qkvdh-u4ATl1WDmc_A0"
 SHEET_NAME = "Sheet1"
 USER_EDITS_SHEET = "_UserEdits"
@@ -251,7 +272,32 @@ def render_email_detail(msg_id, subject, summary_text, actions_text, body_text, 
             st.info("尚無信件內容")
 
     if link:
-        st.markdown(f"[🔗 在 Gmail 中開啟]({link})")
+        st.markdown(f"[🔗 在 Gmail 中開啟原信]({link})")
+
+    # ── AI 回信草稿 ──────────────────────────────────
+    st.divider()
+    st.markdown("### ✍️ AI 一鍵產生回信草稿")
+
+    draft_key = f"_draft_{msg_id}"
+    if st.button("✍️ 產生英文回信草稿", use_container_width=True, key=f"btn_draft_{msg_id}"):
+        with st.spinner("Gemini 正在寫回信(10–20 秒)..."):
+            draft, err = get_reply_draft(msg_id)
+        if draft:
+            st.session_state[draft_key] = draft
+            st.rerun(scope="fragment")
+        else:
+            st.error(f"產生失敗:{err}")
+
+    if draft_key in st.session_state:
+        st.markdown("##### 📝 建議回信(可直接編輯後複製)")
+        st.text_area(
+            "draft",
+            value=st.session_state[draft_key],
+            height=300,
+            key=f"draft_edit_{msg_id}",
+            label_visibility="collapsed",
+        )
+        st.caption("✂️ 滑鼠選取上方文字 → ⌘+C 複製 → 開 Gmail 按 Reply → ⌘+V 貼上")
 
 
 title_col, btn_col = st.columns([4, 1])
@@ -403,7 +449,7 @@ display_df["部門"] = deduped_depts
 
 
 st.subheader(f"📋 待處理清單  ({len(view_df)} 筆)")
-st.caption("💡 點選任一列 → 下方會展開「待辦事項 + 摘要 + 信件原文」")
+st.caption("💡 點選任一列 → 下方會展開「待辦事項 + 摘要 + 信件原文 + AI 回信草稿」")
 
 event = st.dataframe(
     display_df,
