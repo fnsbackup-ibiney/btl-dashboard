@@ -1,5 +1,5 @@
 # app.py
-# BTL Email Monitor - Multi-user OAuth + AI Smart Title (hybrid display)
+# BTL Email Monitor - Multi-user OAuth + AI Smart Title (clean short version)
 
 import base64
 import re
@@ -142,12 +142,11 @@ def format_age(hours):
 
 
 def extract_theme(summary_text):
-    """從 AI 摘要裡抓 Theme 那一行,當作 AI 整理標題。"""
     if not summary_text:
         return ""
     m = re.search(r"\*\*Theme:\*\*\s*(.+?)(?:\n|$)", summary_text)
     if m:
-        return m.group(1).strip()
+        return m.group(1).strip().strip('"').strip("'")
     return ""
 
 
@@ -329,8 +328,12 @@ def gemini_summary_and_actions(msg_id, subject, body):
     prompt = (
         "Analyze this business email and produce TWO sections in English. "
         "Use EXACTLY this format with [---] as separator (no extra text outside):\n\n"
-        "**Theme:** [one concise line that clearly describes WHAT this email is about, like a clean subject line. "
-        "Include key entities (order/style numbers, customer name, action keyword). Keep under 12 words.]\n"
+        "**Theme:** SHORT KEYWORD-STYLE TITLE, MAX 8 WORDS. "
+        "Focus on order/style number + main topic. NO articles (a/the), NO full sentences. "
+        "Examples (good): 'SKY 80025 size sample feedback', 'BRAX 06368 urgent delivery', "
+        "'WH/W26 mockup approval needed', 'YAN 90008 SMS order details'. "
+        "Examples (BAD - too long): 'Approval of revised graded patterns for SKY 80025', "
+        "'Customer asking about shipment status for the BRAX order'.\n"
         "- [Key point 1]\n- [Key point 2]\n- [Key point 3]\n\n"
         "[---]\n\n"
         "**🎯 What you need to do:**\n"
@@ -398,7 +401,6 @@ def gemini_reply_draft(msg_id, subject, body, actions, sender_name, user_first_n
 
 
 def precompute_summaries(items):
-    """背景對所有信先跑摘要,讓 Theme 用於表格顯示。"""
     out = {}
     for it in items:
         summary, actions = gemini_summary_and_actions(it["msg_id"], it["subject"], it["body"])
@@ -456,7 +458,7 @@ def render_email_detail(item, user_name, user_first_name, summary_cache):
 
     st.divider()
     st.markdown(f"### 📄 {display_subject}")
-    if ai_theme and subject and ai_theme != subject:
+    if subject and ai_theme and ai_theme != subject:
         st.caption(f"📨 原始主旨:{subject}")
 
     if display_actions and display_actions.strip():
@@ -476,7 +478,7 @@ def render_email_detail(item, user_name, user_first_name, summary_cache):
     with left_col:
         st.markdown("### ✏️ 可編輯區(改完按下方儲存,僅本次 session 有效)")
         with st.form(key=f"edit_{msg_id}", clear_on_submit=False):
-            new_title = st.text_input("📄 標題(顯示名稱)", value=display_subject)
+            new_title = st.text_input("📄 標題", value=display_subject)
             new_summary = st.text_area("📝 AI 摘要", value=display_summary, height=200)
             new_actions = st.text_area("🎯 待辦事項", value=display_actions, height=200)
             if st.form_submit_button("💾 儲存(僅本次 session)", use_container_width=True):
@@ -553,9 +555,8 @@ def show_main_dashboard():
         st.success("🎉 你的 Gmail 中目前沒有待回客戶信件,辛苦了!")
         return
 
-    # 預先跑所有信摘要,Theme 用來當表格顯示的 AI 標題
     if "summary_cache_for_table" not in st.session_state:
-        with st.spinner(f"🤖 AI 正在整理 {len(items)} 封信的標題(每封 5-8 秒)..."):
+        with st.spinner(f"🤖 AI 正在整理 {len(items)} 封信的標題..."):
             st.session_state["summary_cache_for_table"] = precompute_summaries(items)
     summary_cache = st.session_state["summary_cache_for_table"]
 
@@ -565,13 +566,9 @@ def show_main_dashboard():
         if it["is_today"]:
             badges.append("🔵 當日新進")
         cached = summary_cache.get(it["msg_id"], {})
-        ai_theme = cached.get("theme", "") or it["subject"]
-        original_subject = it["subject"]
-        # 混合式顯示:AI 標題在上,原主旨小字在下
-        if ai_theme and ai_theme != original_subject:
-            display_title = f"**{ai_theme}**\n\n_{original_subject}_"
-        else:
-            display_title = ai_theme or original_subject
+        ai_theme = cached.get("theme", "")
+        # 表格只顯示 AI 整理後的短標題;原主旨在展開區看
+        display_title = ai_theme if ai_theme else it["subject"]
         rows.append({
             "msg_id": it["msg_id"],
             "優先級": " / ".join(badges),
@@ -667,7 +664,7 @@ def show_main_dashboard():
     view_df["部門"] = deduped_depts
 
     st.subheader(f"📋 待處理清單  ({len(view_df)} 筆)")
-    st.caption("💡 點選任一列 → 下方展開待辦事項 + 摘要 + 信件原文 + AI 回信草稿")
+    st.caption("💡 標題是 AI 整理後的短版,點任一列展開可看原主旨 + 摘要 + 待辦 + 信件原文 + AI 回信草稿")
 
     event = st.dataframe(
         view_df,
@@ -680,7 +677,7 @@ def show_main_dashboard():
             "寄件者": st.column_config.TextColumn(width="medium"),
             "部門": st.column_config.TextColumn(width="medium"),
             "優先級": st.column_config.TextColumn(width="medium"),
-            "標題": st.column_config.TextColumn("標題(AI 整理 + 原主旨)", width="large"),
+            "標題": st.column_config.TextColumn("標題(AI 整理)", width="large"),
             "收信日期": st.column_config.TextColumn(width="small"),
             "等待時長": st.column_config.TextColumn(width="small"),
             "郵件連結": st.column_config.LinkColumn(
