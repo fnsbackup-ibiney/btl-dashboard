@@ -222,6 +222,8 @@ def exchange_code_for_token(code):
             "client_secret": CLIENT_SECRET,
             "scopes": OAUTH_SCOPES,
         },
+        # Phase 6 驗證用:Google id_token,後續可以拿來換 Firebase ID token
+        "id_token": token_data.get("id_token", ""),
         "email": user_info.get("email", ""),
         "name": user_info.get("name", ""),
         "picture": user_info.get("picture", ""),
@@ -634,6 +636,107 @@ def render_email_detail(item, user_name, user_first_name, summary_cache, display
         st.caption("✂️ 滑鼠選取 → ⌘+C 複製 → 開 Gmail Reply → ⌘+V 貼上")
 
 
+def phase6_firestore_probe(user):
+    """Phase 6 驗證:測試 user OAuth token 能否寫入 Firestore。
+
+    跑兩個 Plan:
+    - Plan A:用 Google access_token 直接呼叫 Firestore REST API
+    - Plan B:用 Google id_token 換 Firebase ID token,再寫 Firestore
+    每個 Plan 寫一筆到 test_probe collection,印出 HTTP 狀態與回應。
+    """
+    project_id = "trims-f8e4a"
+    firebase_api_key = st.secrets.get("FIREBASE_WEB_API_KEY", "")
+    creds = user.get("creds", {})
+    access_token = creds.get("token", "")
+    id_token = user.get("id_token", "")
+    email = user.get("email", "")
+
+    st.markdown("### 🧪 Phase 6 — Firestore 寫入可行性驗證")
+    st.caption("測試會寫一筆到 `test_probe/<email>`,不影響正式資料。Rules 已限制只能 ibiney.io 寫入。")
+
+    # ── Plan A:直接用 access_token 呼 Firestore REST ────────
+    st.markdown("#### Plan A:Google access_token → Firestore REST")
+    if not access_token:
+        st.error("找不到 access_token,請重新登入")
+    else:
+        url_a = (
+            f"https://firestore.googleapis.com/v1/projects/{project_id}"
+            f"/databases/(default)/documents/test_probe?documentId=planA_{email.replace('@', '_at_')}"
+        )
+        body_a = {"fields": {
+            "plan": {"stringValue": "A"},
+            "email": {"stringValue": email},
+            "ts": {"stringValue": datetime.now(timezone.utc).isoformat()},
+        }}
+        try:
+            resp_a = requests.post(
+                url_a,
+                headers={"Authorization": f"Bearer {access_token}"},
+                json=body_a, timeout=15,
+            )
+            st.write(f"HTTP **{resp_a.status_code}** {'✅ 可行' if resp_a.ok else '❌ 不通'}")
+            with st.expander("查看回應內容"):
+                st.code(resp_a.text[:1500])
+        except Exception as e:
+            st.error(f"Plan A 例外:{e}")
+
+    st.divider()
+
+    # ── Plan B:id_token 換 Firebase token → Firestore ───────
+    st.markdown("#### Plan B:Google id_token → Firebase ID token → Firestore")
+    if not id_token:
+        st.warning(
+            "⚠️ 此 session 沒有 id_token(你登入是在加這個欄位之前)。\n\n"
+            "請按右上「🚪 登出」重新登入,新 session 才有 id_token,Plan B 才能測。"
+        )
+    elif not firebase_api_key:
+        st.warning(
+            "⚠️ Streamlit Secrets 沒設 `FIREBASE_WEB_API_KEY`。\n\n"
+            "Plan B 需要這個 key 才能呼叫 Firebase Identity Toolkit 換 token。\n"
+            "去 https://console.firebase.google.com/project/trims-f8e4a/settings/general → 看 Web API Key,"
+            "貼進 Streamlit Cloud → btl-dashboard → Settings → Secrets,新增:\n"
+            "`FIREBASE_WEB_API_KEY = \"...\"`"
+        )
+    else:
+        try:
+            exchange_url = (
+                f"https://identitytoolkit.googleapis.com/v1/accounts:signInWithIdp"
+                f"?key={firebase_api_key}"
+            )
+            exchange_body = {
+                "postBody": f"id_token={id_token}&providerId=google.com",
+                "requestUri": REDIRECT_URI,
+                "returnSecureToken": True,
+            }
+            ex_resp = requests.post(exchange_url, json=exchange_body, timeout=15)
+            if not ex_resp.ok:
+                st.write(f"Token exchange HTTP **{ex_resp.status_code}** ❌")
+                with st.expander("查看 exchange 失敗回應"):
+                    st.code(ex_resp.text[:1500])
+            else:
+                firebase_id_token = ex_resp.json().get("idToken", "")
+                st.write("Token exchange ✅ 成功")
+                url_b = (
+                    f"https://firestore.googleapis.com/v1/projects/{project_id}"
+                    f"/databases/(default)/documents/test_probe?documentId=planB_{email.replace('@', '_at_')}"
+                )
+                body_b = {"fields": {
+                    "plan": {"stringValue": "B"},
+                    "email": {"stringValue": email},
+                    "ts": {"stringValue": datetime.now(timezone.utc).isoformat()},
+                }}
+                resp_b = requests.post(
+                    url_b,
+                    headers={"Authorization": f"Bearer {firebase_id_token}"},
+                    json=body_b, timeout=15,
+                )
+                st.write(f"Firestore 寫入 HTTP **{resp_b.status_code}** {'✅ 可行' if resp_b.ok else '❌ 不通'}")
+                with st.expander("查看寫入回應"):
+                    st.code(resp_b.text[:1500])
+        except Exception as e:
+            st.error(f"Plan B 例外:{e}")
+
+
 def show_main_dashboard():
     user = st.session_state["user"]
     user_email = user["email"]
@@ -655,6 +758,17 @@ def show_main_dashboard():
             st.session_state.clear()
             st.query_params.clear()
             st.rerun()
+
+    # Phase 6 Firestore 寫入驗證(收在 expander 裡,不影響日常使用)
+    with st.sidebar.expander("🧪 Phase 6 驗證(開發用)"):
+        if st.button("執行 Firestore 寫入測試"):
+            st.session_state["_phase6_probe"] = True
+    if st.session_state.get("_phase6_probe"):
+        phase6_firestore_probe(user)
+        if st.button("關閉驗證面板"):
+            st.session_state.pop("_phase6_probe", None)
+            st.rerun()
+        st.divider()
 
     if "pending_items" not in st.session_state:
         with st.spinner("📬 正在從你的 Gmail 抓取待回信件(30-90 秒,只發生一次)..."):
