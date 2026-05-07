@@ -1590,21 +1590,6 @@ def render_excel_update_panel(user, reminders=None):
                 unsafe_allow_html=True,
             )
 
-            # ── 變化前後對比 ─────────────────────────
-            if r["before_after"]:
-                st.markdown("🔄 **變化前後對比**:")
-                diff_md = "| 欄位 | 原值 | → | 新值 |\n|---|---|---|---|\n"
-                for field, old, new in r["before_after"]:
-                    diff_md += f"| {field} | {old} | → | **{new}** |\n"
-                st.markdown(diff_md)
-            else:
-                st.markdown("🔄 **變化前後對比**:無明確 before/after,需人工判斷")
-
-            # ── 建議更新欄位 ─────────────────────────
-            st.markdown("📋 **建議更新的大貨表欄位**:")
-            for col in r["suggested_columns"]:
-                st.markdown(f"- {col}")
-
             # ── 三個按鈕 ─────────────────────────────
             b1, b2, b3 = st.columns(3)
             with b1:
