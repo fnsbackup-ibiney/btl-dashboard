@@ -1553,7 +1553,7 @@ def render_excel_update_panel(user, reminders=None):
 
     with st.expander(
         f"📊 大貨表 Excel 待更新項目 ({len(pending)} 筆) "
-        f"— 🔴 高信心 {len(high)} / 🟡 中信心 {len(medium)}",
+        f"— 🔴 明確變動 {len(high)} / 🟡 可能需要變動 {len(medium)}",
         expanded=False,
     ):
         st.caption(
@@ -1564,7 +1564,7 @@ def render_excel_update_panel(user, reminders=None):
 
         for idx, r in enumerate(pending):
             confidence_emoji = "🔴" if r["confidence"] == "high" else "🟡"
-            confidence_text = "高信心" if r["confidence"] == "high" else "中信心"
+            confidence_text = "明確變動" if r["confidence"] == "high" else "可能需要變動"
 
             st.markdown("---")
             st.markdown(
@@ -1768,9 +1768,6 @@ def show_main_dashboard():
 
     if unread_cnt > 0:
         st.warning(f"⚠️ 有 **{unread_cnt}** 封還沒打開過,建議優先處理")
-
-    if grouped_count > 0:
-        st.info(f"🔗 偵測到 **{grouped_count}** 封信屬於同主題分組(共用統一標題)")
 
     st.markdown("##### 🏢 快速依客戶篩選")
     client_counts = df["客戶"].value_counts().to_dict()
