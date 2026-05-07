@@ -1086,7 +1086,7 @@ def phase6_firestore_probe(user):
 
 
 # ═══════════════════════════════════════════════════════════════
-# Quality Report:給 David 看的「系統真的有效嗎」客觀證據
+# Quality Report:用客觀數據驗證「系統真的有效嗎」
 # ═══════════════════════════════════════════════════════════════
 
 def gemini_critique_summary(thread_text, ai_summary, ai_actions):
@@ -1351,7 +1351,7 @@ def render_quality_report(user):
     st.markdown("### 📋 Quality Report — 系統正確性驗證")
     st.caption(
         "對 dashboard 做 4 項客觀驗證:過濾正確性、AI 摘要品質、邏輯壓力測試、速度與配額。"
-        " 結果可截圖給 David 當作「grounded in reality」的證據。"
+        " 產出可量化的指標,作為「系統實際有效」的客觀證據。"
     )
 
     if "_quality_report" not in st.session_state:
@@ -1432,7 +1432,7 @@ def render_quality_report(user):
     st.dataframe(d_df, use_container_width=True, hide_index=True)
 
     # ── 整體結論 ──
-    st.markdown("#### 🎯 整體結論(可貼給 David)")
+    st.markdown("#### 🎯 整體結論(可複製貼到報告 / 訊息)")
     verdict = (
         f"**BTL Email Monitor Quality Report — {report['ts'][:10]}**\n\n"
         f"- 過濾正確性:Precision **{a.get('precision_pct', 0)}%** / Recall **{a.get('recall_pct', 0)}%** "
@@ -1450,7 +1450,7 @@ def render_quality_report(user):
         f"- 結論:{'✅ 系統運作正常,可進入下一階段' if (a.get('precision_pct', 0) >= 80 and (b.get('avg_theme_score', 0) or 0) >= 3.5) else '⚠️ 有改進空間'}\n"
     )
     st.code(verdict, language="markdown")
-    st.caption("👆 全選複製這段,貼給 David。")
+    st.caption("👆 全選複製這段,可貼到工作群組或報告。")
 
 
 def show_main_dashboard():
@@ -1477,7 +1477,7 @@ def show_main_dashboard():
 
     # 開發/PRD 用工具(收在 expander 裡,不影響日常使用)
     with st.sidebar.expander("🧪 開發工具"):
-        if st.button("📋 Quality Report(給 David 用)"):
+        if st.button("📋 Quality Report(系統驗證)"):
             st.session_state["_quality_check"] = True
             st.session_state.pop("_quality_report", None)  # 重新跑
         if st.button("Phase 6 Firestore 寫入測試"):
