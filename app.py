@@ -773,6 +773,217 @@ def load_edits_from_firestore(user):
         return {}
 
 
+def analyze_attachments(creds_dict, current_user_email):
+    """掃描使用者過去 SEARCH_DAYS 天的待回 thread,統計附件分佈。
+
+    產出 multi-modal PRD 需要的真實數據:附件類型、客戶分佈、業務話題分佈。
+    回傳 dict 結構,在 streamlit 端渲染成表格。
+    """
+    creds = credentials_from_dict(creds_dict)
+    service = build("gmail", "v1", credentials=creds, cache_discovery=False)
+    query = build_gmail_query()
+    threads_resp = service.users().threads().list(
+        userId="me", q=query, maxResults=200
+    ).execute()
+    threads = threads_resp.get("threads", [])
+
+    stats = {
+        "total_threads": 0,
+        "total_messages": 0,
+        "messages_with_attachments": 0,
+        "messages_without_attachments": 0,
+        "total_attachments": 0,
+        "mime_types": Counter(),       # 每個 MIME 類型計數
+        "file_extensions": Counter(),  # 副檔名計數
+        "client_attachments": Counter(),  # 客戶 → 附件數
+        "subject_keywords": Counter(),    # 主旨關鍵字
+        "size_buckets": Counter(),     # 附件大小分布
+        "thread_with_attachment_count": 0,  # 多少 thread 至少有 1 個附件
+    }
+
+    business_words = [
+        "PI", "PO", "Order", "Sample", "Sendung", "Parcel", "Color",
+        "Approval", "Rejection", "Delivery", "Shipping", "Quote",
+        "Invoice", "Spec", "Quality", "Production", "Material",
+    ]
+
+    for t in threads:
+        thread_full = service.users().threads().get(
+            userId="me", id=t["id"], format="full"
+        ).execute()
+        messages_meta = thread_full.get("messages", [])
+        if not messages_meta:
+            continue
+
+        stats["total_threads"] += 1
+        thread_has_any_attachment = False
+
+        for m in messages_meta:
+            stats["total_messages"] += 1
+            headers = {h["name"]: h["value"] for h in m.get("payload", {}).get("headers", [])}
+            from_h = headers.get("From", "")
+            subject = headers.get("Subject", "")
+
+            # 主旨關鍵字統計
+            for word in business_words:
+                if word.lower() in subject.lower():
+                    stats["subject_keywords"][word] += 1
+
+            # 找附件:遞迴掃 payload.parts,filename 非空就是附件
+            attachments = []
+            def walk_parts(payload):
+                if not payload:
+                    return
+                filename = payload.get("filename", "")
+                if filename:
+                    mime = payload.get("mimeType", "unknown")
+                    size = payload.get("body", {}).get("size", 0)
+                    attachments.append({
+                        "filename": filename,
+                        "mime": mime,
+                        "size": size,
+                    })
+                for sub in payload.get("parts", []) or []:
+                    walk_parts(sub)
+            walk_parts(m.get("payload", {}))
+
+            if attachments:
+                stats["messages_with_attachments"] += 1
+                thread_has_any_attachment = True
+                stats["total_attachments"] += len(attachments)
+
+                client = get_client(from_h)
+                for att in attachments:
+                    mime = att["mime"]
+                    stats["mime_types"][mime] += 1
+                    # 副檔名
+                    fname = att["filename"]
+                    ext = fname.rsplit(".", 1)[-1].lower() if "." in fname else "(no_ext)"
+                    stats["file_extensions"][ext] += 1
+                    # 客戶
+                    stats["client_attachments"][client] += 1
+                    # 大小分布
+                    size = att["size"]
+                    if size < 100_000:
+                        stats["size_buckets"]["< 100KB"] += 1
+                    elif size < 1_000_000:
+                        stats["size_buckets"]["100KB - 1MB"] += 1
+                    elif size < 10_000_000:
+                        stats["size_buckets"]["1MB - 10MB"] += 1
+                    else:
+                        stats["size_buckets"]["> 10MB"] += 1
+            else:
+                stats["messages_without_attachments"] += 1
+
+        if thread_has_any_attachment:
+            stats["thread_with_attachment_count"] += 1
+
+    return stats
+
+
+def render_attachment_analysis(user):
+    """執行 + 渲染附件分析結果(PRD 證據用)。"""
+    st.markdown("### 📊 附件分析(Multi-modal PRD 數據收集)")
+    st.caption(
+        f"掃描你過去 {SEARCH_DAYS} 天 inbox 業務 thread 的附件分佈 — "
+        "這份數據會用來決定 multi-modal 該優先支援什麼檔案類型。"
+    )
+
+    if "_attachment_stats" not in st.session_state:
+        with st.spinner(f"分析 Gmail 附件中(20-40 秒)..."):
+            try:
+                st.session_state["_attachment_stats"] = analyze_attachments(
+                    user["creds"], user["email"]
+                )
+            except Exception as e:
+                st.error(f"分析失敗:{e}")
+                return
+
+    stats = st.session_state["_attachment_stats"]
+
+    # ── 總覽 ──────────────────────────────────────────
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("掃描 Thread 數", stats["total_threads"])
+    c2.metric("總信件數", stats["total_messages"])
+    c3.metric("有附件的信", stats["messages_with_attachments"])
+    c4.metric("總附件數", stats["total_attachments"])
+
+    if stats["total_messages"] == 0:
+        st.warning("沒有找到任何信件")
+        return
+
+    # ── 附件密度 ──────────────────────────────────────
+    pct_with = round(100 * stats["messages_with_attachments"] / stats["total_messages"], 1)
+    pct_thread = round(100 * stats["thread_with_attachment_count"] / stats["total_threads"], 1)
+    st.markdown(f"""
+    **📌 附件密度**:
+    - 有附件的信佔 **{pct_with}%**({stats['messages_with_attachments']}/{stats['total_messages']})
+    - 有附件的 thread 佔 **{pct_thread}%**({stats['thread_with_attachment_count']}/{stats['total_threads']})
+    - 平均每封有附件的信 = **{round(stats['total_attachments'] / max(stats['messages_with_attachments'], 1), 2)} 個**附件
+    """)
+
+    # ── 副檔名 Top 10 ────────────────────────────────
+    st.markdown("#### 📁 附件副檔名分佈(這個最關鍵 — 決定要支援哪些格式)")
+    if stats["file_extensions"]:
+        ext_df = pd.DataFrame(
+            stats["file_extensions"].most_common(15),
+            columns=["副檔名", "出現次數"],
+        )
+        ext_df["佔比"] = ext_df["出現次數"].apply(
+            lambda n: f"{round(100 * n / stats['total_attachments'], 1)}%"
+        )
+        st.dataframe(ext_df, use_container_width=True, hide_index=True)
+    else:
+        st.info("沒有附件可分析")
+
+    # ── MIME 類型 ────────────────────────────────────
+    st.markdown("#### 🔬 MIME 類型(技術精確版)")
+    if stats["mime_types"]:
+        mime_df = pd.DataFrame(
+            stats["mime_types"].most_common(15),
+            columns=["MIME", "次數"],
+        )
+        st.dataframe(mime_df, use_container_width=True, hide_index=True)
+
+    # ── 客戶分佈 ────────────────────────────────────
+    st.markdown("#### 🏢 哪些客戶最常寄附件?")
+    if stats["client_attachments"]:
+        client_df = pd.DataFrame(
+            stats["client_attachments"].most_common(10),
+            columns=["客戶", "附件數"],
+        )
+        st.dataframe(client_df, use_container_width=True, hide_index=True)
+
+    # ── 附件大小 ───────────────────────────────────
+    st.markdown("#### 📦 附件大小分佈(影響 Gemini upload 時間)")
+    if stats["size_buckets"]:
+        size_df = pd.DataFrame(
+            list(stats["size_buckets"].items()),
+            columns=["大小範圍", "個數"],
+        )
+        st.dataframe(size_df, use_container_width=True, hide_index=True)
+
+    # ── 主旨關鍵字 ──────────────────────────────────
+    st.markdown("#### 💬 主旨業務關鍵字 Top 10(內容話題分佈)")
+    if stats["subject_keywords"]:
+        kw_df = pd.DataFrame(
+            stats["subject_keywords"].most_common(10),
+            columns=["關鍵字", "出現次數"],
+        )
+        st.dataframe(kw_df, use_container_width=True, hide_index=True)
+
+    # ── 給 PRD 的洞察 ───────────────────────────────
+    st.markdown("#### 💡 對 PRD 的初步洞察")
+    top_exts = stats["file_extensions"].most_common(3)
+    if top_exts:
+        top_summary = ", ".join([f"`.{e}` ({n})" for e, n in top_exts])
+        st.info(
+            f"**Top 3 副檔名**:{top_summary}\n\n"
+            f"→ Multi-modal 第一階段建議優先支援:**{top_exts[0][0]}**"
+            f"({round(100 * top_exts[0][1] / stats['total_attachments'], 1)}% 涵蓋率)"
+        )
+
+
 def phase6_firestore_probe(user):
     """Phase 6 驗證:測試 user OAuth token 能否寫入 Firestore。
 
@@ -896,14 +1107,26 @@ def show_main_dashboard():
             st.query_params.clear()
             st.rerun()
 
-    # Phase 6 Firestore 寫入驗證(收在 expander 裡,不影響日常使用)
-    with st.sidebar.expander("🧪 Phase 6 驗證(開發用)"):
-        if st.button("執行 Firestore 寫入測試"):
+    # 開發/PRD 用工具(收在 expander 裡,不影響日常使用)
+    with st.sidebar.expander("🧪 開發工具"):
+        if st.button("Phase 6 Firestore 寫入測試"):
             st.session_state["_phase6_probe"] = True
+        if st.button("📊 附件分析(PRD 用)"):
+            st.session_state["_attachment_analysis"] = True
+            st.session_state.pop("_attachment_stats", None)  # 重新分析
+
     if st.session_state.get("_phase6_probe"):
         phase6_firestore_probe(user)
         if st.button("關閉驗證面板"):
             st.session_state.pop("_phase6_probe", None)
+            st.rerun()
+        st.divider()
+
+    if st.session_state.get("_attachment_analysis"):
+        render_attachment_analysis(user)
+        if st.button("關閉附件分析面板"):
+            st.session_state.pop("_attachment_analysis", None)
+            st.session_state.pop("_attachment_stats", None)
             st.rerun()
         st.divider()
 
