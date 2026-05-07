@@ -540,6 +540,107 @@ def show_login_page():
     st.caption("⚠️ 首次登入會看到「Google hasn't verified this app」警告 → 點 Advanced → Continue,因為這是 ibiney 公司內部 app。")
 
 
+def _encode_session_marker(refresh_token, email):
+    """把 refresh_token + email 編成可放 URL 的短字串。
+
+    refresh_token 不是密碼,但仍是敏感資訊;放 URL 算是 trade-off。
+    用 base64 url-safe encoding 避免特殊字元。
+    """
+    import json as _json
+    payload = _json.dumps({"rt": refresh_token, "em": email})
+    return base64.urlsafe_b64encode(payload.encode("utf-8")).decode("ascii")
+
+
+def _decode_session_marker(marker):
+    """反向解碼。失敗回 None。"""
+    import json as _json
+    try:
+        decoded = base64.urlsafe_b64decode(marker.encode("ascii")).decode("utf-8")
+        data = _json.loads(decoded)
+        return data.get("rt"), data.get("em")
+    except Exception:
+        return None, None
+
+
+def _refresh_access_token(refresh_token):
+    """用 refresh_token 換新的 access_token + id_token。
+
+    Google OAuth refresh_token 不會過期(除非用戶撤銷),
+    所以可以一直用它來重新拿短期的 access_token。
+    """
+    try:
+        resp = requests.post(
+            "https://oauth2.googleapis.com/token",
+            data={
+                "refresh_token": refresh_token,
+                "client_id": CLIENT_ID,
+                "client_secret": CLIENT_SECRET,
+                "grant_type": "refresh_token",
+            },
+            timeout=15,
+        )
+        if not resp.ok:
+            return None
+        return resp.json()  # {access_token, expires_in, id_token, ...}
+    except Exception:
+        return None
+
+
+def restore_session_from_url():
+    """從 URL `?_s=...` 還原使用者 session(支援瀏覽器重新整理)。
+
+    流程:
+    1. 看 URL 有沒有 `_s` 參數
+    2. 解出 refresh_token + email
+    3. 用 refresh_token 換新 access_token
+    4. 抓 user info(name / picture)
+    5. 寫進 session_state["user"]
+    """
+    qp = st.query_params
+    if "_s" not in qp:
+        return False
+    if "user" in st.session_state:
+        return True  # 已經有了
+
+    refresh_token, email = _decode_session_marker(qp["_s"])
+    if not refresh_token or not email:
+        # marker 壞了,清掉它
+        try:
+            del st.query_params["_s"]
+        except Exception:
+            pass
+        return False
+
+    token_data = _refresh_access_token(refresh_token)
+    if not token_data:
+        return False
+
+    try:
+        user_info = requests.get(
+            "https://www.googleapis.com/oauth2/v1/userinfo",
+            headers={"Authorization": f"Bearer {token_data['access_token']}"},
+            timeout=10,
+        ).json()
+    except Exception:
+        return False
+
+    st.session_state["user"] = {
+        "creds": {
+            "token": token_data["access_token"],
+            "refresh_token": refresh_token,  # 保留,refresh_token 不會過期
+            "token_uri": "https://oauth2.googleapis.com/token",
+            "client_id": CLIENT_ID,
+            "client_secret": CLIENT_SECRET,
+            "scopes": OAUTH_SCOPES,
+        },
+        "id_token": token_data.get("id_token", ""),
+        "email": user_info.get("email", email),
+        "name": user_info.get("name", ""),
+        "picture": user_info.get("picture", ""),
+    }
+    return True
+
+
 def handle_oauth_callback():
     qp = st.query_params
     if "code" not in qp:
@@ -550,7 +651,15 @@ def handle_oauth_callback():
             st.error(f"此系統僅限 @{INTERNAL_DOMAIN} 同事使用。你的帳號:{result['email']}")
             st.stop()
         st.session_state["user"] = result
-        st.query_params.clear()
+
+        # 把 refresh_token + email 寫進 URL,讓重新整理時可以還原 session
+        rt = result.get("creds", {}).get("refresh_token", "")
+        if rt:
+            marker = _encode_session_marker(rt, result["email"])
+            st.query_params.clear()
+            st.query_params["_s"] = marker
+        else:
+            st.query_params.clear()
         st.rerun()
     except Exception as e:
         st.error(f"登入失敗:{e}")
@@ -1856,6 +1965,9 @@ def show_main_dashboard():
 
 def main():
     handle_oauth_callback()
+    # 沒 user 時,先試從 URL 還原(支援瀏覽器重新整理免重新登入)
+    if "user" not in st.session_state:
+        restore_session_from_url()
     if "user" not in st.session_state:
         show_login_page()
     else:
