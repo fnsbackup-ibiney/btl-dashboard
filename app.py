@@ -1085,6 +1085,374 @@ def phase6_firestore_probe(user):
             st.error(f"Plan B 例外:{e}")
 
 
+# ═══════════════════════════════════════════════════════════════
+# Quality Report:給 David 看的「系統真的有效嗎」客觀證據
+# ═══════════════════════════════════════════════════════════════
+
+def gemini_critique_summary(thread_text, ai_summary, ai_actions):
+    """讓另一個 Gemini call 扮演評審,評分既有的 AI 摘要 + 待辦。
+
+    回傳 dict:{theme_score, bullets_score, actions_score, awaiting_correct, notes}
+    每個分數 1-5。失敗回 None。
+    """
+    prompt = (
+        "You are an expert evaluator. Below is an email thread and an AI-generated "
+        "summary + action items. Score the AI output on 4 dimensions (1=worst, 5=perfect):\n\n"
+        "1. theme_score: Is the Theme line accurate to what the thread is actually about?\n"
+        "2. bullets_score: Do the 3 bullets capture the most important points across the WHOLE thread?\n"
+        "3. actions_score: Are the action items specific and actionable for the recipient?\n"
+        "4. awaiting_correct: Is the 'Awaiting your reply' judgment correct given the thread state? "
+        "(5 = totally correct, 1 = clearly wrong)\n"
+        "5. notes: One-line critique of the biggest weakness, or 'None' if perfect.\n\n"
+        "Output STRICT JSON only, no markdown, no commentary:\n"
+        '{"theme_score": N, "bullets_score": N, "actions_score": N, "awaiting_correct": N, "notes": "..."}\n\n'
+        f"=== Email Thread ===\n{thread_text[:8000]}\n=== End ===\n\n"
+        f"=== AI Summary ===\n{ai_summary}\n=== End ===\n\n"
+        f"=== AI Actions ===\n{ai_actions}\n=== End ==="
+    )
+    try:
+        resp = requests.post(
+            GEMINI_API_URL,
+            json={
+                "contents": [{"parts": [{"text": prompt}]}],
+                "generationConfig": {
+                    "temperature": 0.1, "maxOutputTokens": 400,
+                    "thinkingConfig": {"thinkingBudget": 0},
+                },
+            },
+            timeout=30,
+        )
+        if not resp.ok:
+            return None
+        text = "".join(p.get("text", "") for p in resp.json()["candidates"][0]["content"]["parts"]).strip()
+        # Strip markdown fences if Gemini still added them
+        if text.startswith("```"):
+            text = re.sub(r"^```(?:json)?\s*", "", text)
+            text = re.sub(r"\s*```$", "", text)
+        import json as _json
+        return _json.loads(text)
+    except Exception:
+        return None
+
+
+def fetch_all_business_threads(creds_dict, with_subjects=True):
+    """抓 SEARCH_DAYS 天內所有「主旨含業務關鍵字」的 thread,回傳 thread metadata list。
+
+    與 fetch_pending_emails 不同,這裡不套用「最後外部寄件者 + 我未回」過濾。
+    用來做雙向比對:看完整 universe 大小,跟 dashboard 顯示的差距。
+    """
+    creds = credentials_from_dict(creds_dict)
+    service = build("gmail", "v1", credentials=creds, cache_discovery=False)
+    query = build_gmail_query()
+    resp = service.users().threads().list(
+        userId="me", q=query, maxResults=200
+    ).execute()
+    threads = resp.get("threads", [])
+
+    out = []
+    for t in threads:
+        full = service.users().threads().get(
+            userId="me", id=t["id"], format="metadata",
+            metadataHeaders=["From", "Subject", "Date"],
+        ).execute()
+        messages = full.get("messages", [])
+        if not messages:
+            continue
+
+        # 找最後一封外部 + 之後是否有當前 user 回覆
+        last_ext_from = None
+        last_ext_idx = -1
+        for i in range(len(messages) - 1, -1, -1):
+            headers = {h["name"]: h["value"] for h in messages[i].get("payload", {}).get("headers", [])}
+            from_email = extract_email(headers.get("From", ""))
+            if from_email and not is_internal(from_email):
+                last_ext_from = headers.get("From", "")
+                last_ext_idx = i
+                break
+
+        user_replied_after = False
+        if last_ext_idx >= 0:
+            for j in range(last_ext_idx + 1, len(messages)):
+                headers = {h["name"]: h["value"] for h in messages[j].get("payload", {}).get("headers", [])}
+                from_email = extract_email(headers.get("From", ""))
+                # 注意:這裡無法精確判斷「當前 user」是誰,因為這函式不傳 user_email
+                # 改成:看是不是 internal domain → 任一 ibiney 都算「我們有人回了」
+                if from_email and is_internal(from_email):
+                    user_replied_after = True
+                    break
+
+        last_msg_headers = {h["name"]: h["value"] for h in messages[-1].get("payload", {}).get("headers", [])}
+
+        out.append({
+            "thread_id": t["id"],
+            "msg_count": len(messages),
+            "last_subject": last_msg_headers.get("Subject", ""),
+            "last_from": last_msg_headers.get("From", ""),
+            "last_external_from": last_ext_from,
+            "has_external_message": last_ext_idx >= 0,
+            "internal_replied_after_external": user_replied_after,
+        })
+    return out
+
+
+def run_quality_report(user, sample_size=10):
+    """執行 4 大測試,產出 Quality Report dict。
+
+    Test A: 過濾邏輯雙向比對(universe vs dashboard)
+    Test B: AI 摘要 self-critique(隨機抽樣)
+    Test C: Last-external-sender 邏輯 confusion matrix
+    Test D: 速度與配額
+    """
+    import time
+    import random
+
+    report = {
+        "ts": datetime.now(timezone.utc).isoformat(),
+        "user_email": user.get("email", ""),
+        "search_days": SEARCH_DAYS,
+    }
+
+    # ── Test A:過濾雙向比對 + Test C:邏輯 confusion ──
+    t_start = time.time()
+    universe = fetch_all_business_threads(user["creds"], with_subjects=True)
+    universe_secs = round(time.time() - t_start, 1)
+
+    # universe 中:有外部信 + 內部還沒回 = 應該顯示
+    should_show = [u for u in universe
+                   if u["has_external_message"]
+                   and not u["internal_replied_after_external"]]
+    should_hide = [u for u in universe
+                   if not u["has_external_message"]
+                   or u["internal_replied_after_external"]]
+
+    items = st.session_state.get("pending_items", [])
+    shown_thread_ids = set()
+    # pending_items 沒存 thread_id,改用 msg_id 對 last 一封 → 反查 universe 裡的 thread
+    # 這裡放寬:用 last_external_from + subject 比對
+    shown_subjects = {(it["subject"], extract_email(it["from"])): it for it in items}
+
+    matched_show = 0
+    missed_show = []  # 應該顯示但沒顯示
+    for u in should_show:
+        key = (u["last_subject"], extract_email(u["last_external_from"] or ""))
+        if key in shown_subjects:
+            matched_show += 1
+        else:
+            missed_show.append(u)
+
+    false_positive = []  # 顯示了但 universe 認為不該
+    should_hide_keys = {(u["last_subject"], extract_email(u["last_external_from"] or "")): u
+                        for u in should_hide}
+    for k, _ in shown_subjects.items():
+        if k in should_hide_keys:
+            false_positive.append(k)
+
+    precision = round(100 * matched_show / max(len(items), 1), 1) if items else 0
+    recall = round(100 * matched_show / max(len(should_show), 1), 1) if should_show else 0
+
+    report["test_a"] = {
+        "universe_size": len(universe),
+        "should_show_count": len(should_show),
+        "dashboard_shown_count": len(items),
+        "matched": matched_show,
+        "missed": len(missed_show),
+        "false_positive": len(false_positive),
+        "precision_pct": precision,
+        "recall_pct": recall,
+        "missed_examples": [
+            {"subject": m["last_subject"], "from": m["last_external_from"]}
+            for m in missed_show[:5]
+        ],
+        "false_positive_examples": list(false_positive[:5]),
+        "fetch_time_secs": universe_secs,
+    }
+
+    # ── Test B:AI 摘要 self-critique ──
+    summary_cache = st.session_state.get("summary_cache_for_table", {})
+    eligible = [it for it in items if it["msg_id"] in summary_cache]
+
+    sample = random.sample(eligible, min(sample_size, len(eligible))) if eligible else []
+    critiques = []
+    t_critique_start = time.time()
+
+    for it in sample:
+        cache_entry = summary_cache.get(it["msg_id"], {})
+        ai_summary = cache_entry.get("summary", "")
+        ai_actions = cache_entry.get("actions", "")
+        if not ai_summary:
+            continue
+        result = gemini_critique_summary(
+            it.get("thread_text", it.get("body", "")), ai_summary, ai_actions
+        )
+        if result:
+            critiques.append({
+                "msg_id": it["msg_id"],
+                "subject": it["subject"][:60],
+                **result,
+            })
+    critique_secs = round(time.time() - t_critique_start, 1)
+
+    if critiques:
+        avg_theme = round(sum(c.get("theme_score", 0) for c in critiques) / len(critiques), 2)
+        avg_bullets = round(sum(c.get("bullets_score", 0) for c in critiques) / len(critiques), 2)
+        avg_actions = round(sum(c.get("actions_score", 0) for c in critiques) / len(critiques), 2)
+        avg_await = round(sum(c.get("awaiting_correct", 0) for c in critiques) / len(critiques), 2)
+        weak_notes = [c["notes"] for c in critiques
+                      if c.get("notes") and c["notes"].lower() != "none"]
+        report["test_b"] = {
+            "sample_size": len(critiques),
+            "avg_theme_score": avg_theme,
+            "avg_bullets_score": avg_bullets,
+            "avg_actions_score": avg_actions,
+            "avg_awaiting_correct": avg_await,
+            "weak_examples": weak_notes[:5],
+            "critique_time_secs": critique_secs,
+            "extra_gemini_calls": len(critiques),
+        }
+    else:
+        report["test_b"] = {
+            "sample_size": 0, "note": "沒有可評估的摘要(可能 dashboard 還沒抓信)"
+        }
+
+    # ── Test C:Confusion matrix(基於 universe vs dashboard 對照) ──
+    tp = matched_show                         # 該顯示且顯示
+    fn = len(missed_show)                     # 該顯示但沒顯示
+    fp = len(false_positive)                  # 不該顯示卻顯示
+    tn = len(should_hide) - fp                # 不該顯示也沒顯示
+    report["test_c"] = {
+        "true_positive": tp, "false_negative": fn,
+        "false_positive": fp, "true_negative": max(tn, 0),
+        "f1_score": round(2 * precision * recall / max(precision + recall, 1), 1),
+    }
+
+    # ── Test D:速度 / 配額 ──
+    n_items = len(items)
+    # 估算:每封信摘要約 0.7 ~ 1.5 token-burst,平均約 1 call/封
+    estimated_calls_today = n_items + len(critiques)
+    GEMINI_FREE_QUOTA = 1500
+    est_5_user = estimated_calls_today * 5
+
+    report["test_d"] = {
+        "fetch_universe_secs": universe_secs,
+        "items_in_dashboard": n_items,
+        "summary_critique_secs": critique_secs,
+        "estimated_gemini_calls_today_1user": estimated_calls_today,
+        "estimated_gemini_calls_today_5users": est_5_user,
+        "free_quota_per_day": GEMINI_FREE_QUOTA,
+        "quota_usage_5user_pct": round(100 * est_5_user / GEMINI_FREE_QUOTA, 1),
+        "quota_safe": est_5_user < GEMINI_FREE_QUOTA,
+    }
+
+    return report
+
+
+def render_quality_report(user):
+    """執行並顯示 Quality Report。"""
+    st.markdown("### 📋 Quality Report — 系統正確性驗證")
+    st.caption(
+        "對 dashboard 做 4 項客觀驗證:過濾正確性、AI 摘要品質、邏輯壓力測試、速度與配額。"
+        " 結果可截圖給 David 當作「grounded in reality」的證據。"
+    )
+
+    if "_quality_report" not in st.session_state:
+        if "pending_items" not in st.session_state:
+            st.warning("請先讓 dashboard 抓完信件再跑 Quality Report")
+            return
+        with st.spinner("⏳ 跑驗證中(可能花 30-60 秒,會多用 ~10 次 Gemini 呼叫)..."):
+            st.session_state["_quality_report"] = run_quality_report(user)
+
+    report = st.session_state["_quality_report"]
+
+    # ── Test A:過濾正確性 ──
+    a = report.get("test_a", {})
+    st.markdown("#### 1️⃣ 過濾邏輯正確性(Precision / Recall)")
+    c1, c2, c3 = st.columns(3)
+    c1.metric("精準率 Precision", f"{a.get('precision_pct', 0)}%",
+              help="dashboard 顯示的信中有多少確實該回")
+    c2.metric("召回率 Recall", f"{a.get('recall_pct', 0)}%",
+              help="該顯示的信有多少被顯示")
+    c3.metric("F1 Score", f"{report.get('test_c', {}).get('f1_score', 0)}",
+              help="精準率與召回率的調和平均")
+
+    a_summary = pd.DataFrame([
+        ["業務 thread 全集大小", a.get("universe_size", 0)],
+        ["邏輯上應該顯示", a.get("should_show_count", 0)],
+        ["dashboard 實際顯示", a.get("dashboard_shown_count", 0)],
+        ["匹配上(該顯示且顯示)", a.get("matched", 0)],
+        ["漏掉(該顯示沒顯示)", a.get("missed", 0)],
+        ["誤判(顯示但不該)", a.get("false_positive", 0)],
+    ], columns=["項目", "數量"])
+    st.dataframe(a_summary, use_container_width=True, hide_index=True)
+
+    if a.get("missed_examples"):
+        with st.expander(f"⚠️ 漏判例子({a.get('missed', 0)} 件)"):
+            for ex in a["missed_examples"]:
+                st.markdown(f"- **{ex['subject']}** — from {ex['from']}")
+
+    # ── Test B:AI 品質 ──
+    b = report.get("test_b", {})
+    st.markdown("#### 2️⃣ AI 摘要品質(Gemini self-critique 評分,1-5)")
+    if b.get("sample_size", 0) > 0:
+        c1, c2, c3, c4 = st.columns(4)
+        c1.metric("Theme 準確度", f"{b['avg_theme_score']} / 5")
+        c2.metric("Bullets 準確度", f"{b['avg_bullets_score']} / 5")
+        c3.metric("Actions 可行度", f"{b['avg_actions_score']} / 5")
+        c4.metric("Awaiting 正確", f"{b['avg_awaiting_correct']} / 5")
+        st.caption(f"樣本數:{b['sample_size']} 封 / 評估耗時 {b.get('critique_time_secs', 0)} 秒")
+
+        if b.get("weak_examples"):
+            with st.expander("⚠️ 主要弱點(評審指出的問題)"):
+                for note in b["weak_examples"]:
+                    st.markdown(f"- {note}")
+    else:
+        st.info(b.get("note", "沒有可評估的摘要"))
+
+    # ── Test C:Confusion ──
+    c = report.get("test_c", {})
+    st.markdown("#### 3️⃣ 邏輯壓力測試(Confusion Matrix)")
+    cm = pd.DataFrame([
+        ["**該顯示**", c.get("true_positive", 0), c.get("false_negative", 0)],
+        ["**不該顯示**", c.get("false_positive", 0), c.get("true_negative", 0)],
+    ], columns=["實際情況 / 預測", "✅ 顯示了", "❌ 沒顯示"])
+    st.dataframe(cm, use_container_width=True, hide_index=True)
+
+    # ── Test D:速度配額 ──
+    d = report.get("test_d", {})
+    st.markdown("#### 4️⃣ 速度與配額")
+    d_df = pd.DataFrame([
+        ["抓 Gmail 全集耗時", f"{d.get('fetch_universe_secs', 0)} 秒"],
+        ["dashboard 顯示信數", d.get("items_in_dashboard", 0)],
+        ["評估摘要耗時", f"{d.get('summary_critique_secs', 0)} 秒"],
+        ["當天 Gemini 呼叫數(1 人)", d.get("estimated_gemini_calls_today_1user", 0)],
+        ["當天 Gemini 呼叫數(估算 5 人)", d.get("estimated_gemini_calls_today_5users", 0)],
+        ["免費額度", d.get("free_quota_per_day", 1500)],
+        ["5 人並用配額占比", f"{d.get('quota_usage_5user_pct', 0)}%"],
+        ["配額是否安全", "✅ 是" if d.get("quota_safe") else "❌ 會撞牆"],
+    ], columns=["指標", "數值"])
+    st.dataframe(d_df, use_container_width=True, hide_index=True)
+
+    # ── 整體結論 ──
+    st.markdown("#### 🎯 整體結論(可貼給 David)")
+    verdict = (
+        f"**BTL Email Monitor Quality Report — {report['ts'][:10]}**\n\n"
+        f"- 過濾正確性:Precision **{a.get('precision_pct', 0)}%** / Recall **{a.get('recall_pct', 0)}%** "
+        f"(F1 = {c.get('f1_score', 0)})\n"
+        f"- AI 摘要品質(N={b.get('sample_size', 0)} 樣本):"
+        f"Theme {b.get('avg_theme_score', 'N/A')}/5、"
+        f"Bullets {b.get('avg_bullets_score', 'N/A')}/5、"
+        f"Actions {b.get('avg_actions_score', 'N/A')}/5、"
+        f"Awaiting 判斷 {b.get('avg_awaiting_correct', 'N/A')}/5\n"
+        f"- Confusion: TP={c.get('true_positive', 0)}, "
+        f"FN={c.get('false_negative', 0)}, FP={c.get('false_positive', 0)}, "
+        f"TN={c.get('true_negative', 0)}\n"
+        f"- 速度:抓信 {d.get('fetch_universe_secs', 0)} 秒,"
+        f"5 人並用估佔配額 {d.get('quota_usage_5user_pct', 0)}%\n"
+        f"- 結論:{'✅ 系統運作正常,可進入下一階段' if (a.get('precision_pct', 0) >= 80 and (b.get('avg_theme_score', 0) or 0) >= 3.5) else '⚠️ 有改進空間'}\n"
+    )
+    st.code(verdict, language="markdown")
+    st.caption("👆 全選複製這段,貼給 David。")
+
+
 def show_main_dashboard():
     user = st.session_state["user"]
     user_email = user["email"]
@@ -1109,11 +1477,22 @@ def show_main_dashboard():
 
     # 開發/PRD 用工具(收在 expander 裡,不影響日常使用)
     with st.sidebar.expander("🧪 開發工具"):
+        if st.button("📋 Quality Report(給 David 用)"):
+            st.session_state["_quality_check"] = True
+            st.session_state.pop("_quality_report", None)  # 重新跑
         if st.button("Phase 6 Firestore 寫入測試"):
             st.session_state["_phase6_probe"] = True
         if st.button("📊 附件分析(PRD 用)"):
             st.session_state["_attachment_analysis"] = True
             st.session_state.pop("_attachment_stats", None)  # 重新分析
+
+    if st.session_state.get("_quality_check"):
+        render_quality_report(user)
+        if st.button("關閉 Quality Report"):
+            st.session_state.pop("_quality_check", None)
+            st.session_state.pop("_quality_report", None)
+            st.rerun()
+        st.divider()
 
     if st.session_state.get("_phase6_probe"):
         phase6_firestore_probe(user)
