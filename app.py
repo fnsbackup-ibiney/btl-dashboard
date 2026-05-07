@@ -37,7 +37,7 @@ GEMINI_API_URL = (
 BUSINESS_KEYWORDS = ["SKY", "FNS", "BTL", "WH", "FCL", "Sendung", "Parcel", "Order"]
 NOISE_DOMAINS = ["blot.new", "cloudhq.net", "bolt.eu"]
 INTERNAL_DOMAIN = "ibiney.io"
-SEARCH_DAYS = 7
+SEARCH_DAYS = 3
 BODY_MAX_CHARS = 3000
 # 整 thread 餵 Gemini 時,單封信內容上限(避免超大附件信吃光配額)
 THREAD_PER_MSG_CHARS = 1500
