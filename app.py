@@ -1453,6 +1453,183 @@ def render_quality_report(user):
     st.caption("👆 全選複製這段,可貼到工作群組或報告。")
 
 
+# ═══════════════════════════════════════════════════════════════
+# Excel Update Reminders (alert-only, NEVER touches the spreadsheet)
+# ═══════════════════════════════════════════════════════════════
+
+# Phase 1 sample data — replace with real AI detection in Phase 2
+SAMPLE_EXCEL_REMINDERS = [
+    {
+        "msg_id": "sample_001",
+        "client": "Skyfashion",
+        "style": "SKY 80025",
+        "title": "Color ratio change",
+        "confidence": "high",          # high | medium
+        "email_subject": "Re: SKY 80025 trims approval",
+        "email_date": "2026-05-06 14:23",
+        "from": "franky@skyfashion-jx.com",
+        "quote": (
+            "OK but please change ratio to navy 60% / black 40%, "
+            "others remain. Please update PI accordingly."
+        ),
+        "before_after": [
+            ("navy", "50%", "60%"),
+            ("black", "50%", "40%"),
+        ],
+        "suggested_columns": ["Color ratio (navy / black)", "PI version"],
+        "gmail_link": "https://mail.google.com/mail/u/0/#inbox/sample_001",
+    },
+    {
+        "msg_id": "sample_002",
+        "client": "Fuchsschmitt",
+        "style": "WH 80512",
+        "title": "Delivery date push",
+        "confidence": "high",
+        "email_subject": "WH 80512 — delivery update needed",
+        "email_date": "2026-05-07 09:11",
+        "from": "l.bickert@fuchsschmitt.de",
+        "quote": (
+            "Due to factory holiday, we need to push delivery from "
+            "Sept 15 to Sept 22. Please confirm and update accordingly."
+        ),
+        "before_after": [
+            ("Delivery date", "2026-09-15", "2026-09-22"),
+        ],
+        "suggested_columns": ["Delivery date", "Production schedule"],
+        "gmail_link": "https://mail.google.com/mail/u/0/#inbox/sample_002",
+    },
+    {
+        "msg_id": "sample_003",
+        "client": "Brax",
+        "style": "BRAX 06388",
+        "title": "Pricing comment (review)",
+        "confidence": "medium",
+        "email_subject": "Comments on PI BRAX 06388",
+        "email_date": "2026-05-07 11:45",
+        "from": "sohaib.irshad@brax.com",
+        "quote": (
+            "Please double-check pricing for color #03 — seems higher "
+            "than agreed. Awaiting your revised PI."
+        ),
+        "before_after": [],   # no clear before/after, comment only
+        "suggested_columns": ["Unit price (color #03)", "Comments"],
+        "gmail_link": "https://mail.google.com/mail/u/0/#inbox/sample_003",
+    },
+]
+
+
+def get_reminder_state(user, msg_id):
+    """讀取一筆 reminder 的狀態(updated / dismissed / 無紀錄)。
+
+    Phase 1:暫用 session_state。Phase 2 整合時改成讀 Firestore
+    users/{email}/reminders/{msg_id}。
+    """
+    return st.session_state.get(f"_reminder_state_{msg_id}", "pending")
+
+
+def set_reminder_state(user, msg_id, state):
+    """標記 reminder 狀態:updated / dismissed / pending"""
+    st.session_state[f"_reminder_state_{msg_id}"] = state
+    # TODO Phase 2:同步寫進 Firestore reminders/{msg_id}
+
+
+def render_excel_update_panel(user, reminders=None):
+    """頂部面板 — 顯示「需要更新大貨表」的提醒清單。
+
+    系統絕不直接改 Excel,只負責提醒人工去更新。
+    """
+    if reminders is None:
+        reminders = SAMPLE_EXCEL_REMINDERS  # Phase 1 demo data
+
+    # 過濾掉已標記 updated 或 dismissed 的
+    pending = [r for r in reminders
+               if get_reminder_state(user, r["msg_id"]) == "pending"]
+
+    if not pending:
+        return  # 沒有 pending 的就不顯示
+
+    high = [r for r in pending if r["confidence"] == "high"]
+    medium = [r for r in pending if r["confidence"] == "medium"]
+
+    with st.expander(
+        f"📊 大貨表 Excel 待更新項目 ({len(pending)} 筆) "
+        f"— 🔴 高信心 {len(high)} / 🟡 中信心 {len(medium)}",
+        expanded=False,
+    ):
+        st.caption(
+            "🛡️ **系統永遠不會直接修改你的 Excel** — "
+            "以下項目是 AI 偵測到客戶在信件中 confirm / 變更 / 留下 comment,"
+            "建議你手動去更新大貨表。"
+        )
+
+        for idx, r in enumerate(pending):
+            confidence_emoji = "🔴" if r["confidence"] == "high" else "🟡"
+            confidence_text = "高信心" if r["confidence"] == "high" else "中信心"
+
+            st.markdown("---")
+            st.markdown(
+                f"### #{idx + 1}  {confidence_emoji}  "
+                f"{r['client']} / {r['style']} — {r['title']}  "
+                f"<span style='color:#888;font-size:0.8em'>({confidence_text})</span>",
+                unsafe_allow_html=True,
+            )
+
+            # ── 信件來源 ─────────────────────────────────
+            st.markdown(
+                f"📧 **{r['email_subject']}**  \n"
+                f"👤 {r['from']}   📅 {r['email_date']}"
+            )
+
+            # ── 原信原文片段(灰底引用框) ─────────────
+            st.markdown("📝 **客戶說了什麼**:")
+            st.markdown(
+                f"<div style='background:#f1f3f4;border-left:4px solid #1a73e8;"
+                f"padding:10px 14px;border-radius:4px;color:#444;"
+                f"font-style:italic;margin:6px 0;'>"
+                f"\"{r['quote']}\"</div>",
+                unsafe_allow_html=True,
+            )
+
+            # ── 變化前後對比 ─────────────────────────
+            if r["before_after"]:
+                st.markdown("🔄 **變化前後對比**:")
+                diff_md = "| 欄位 | 原值 | → | 新值 |\n|---|---|---|---|\n"
+                for field, old, new in r["before_after"]:
+                    diff_md += f"| {field} | {old} | → | **{new}** |\n"
+                st.markdown(diff_md)
+            else:
+                st.markdown("🔄 **變化前後對比**:無明確 before/after,需人工判斷")
+
+            # ── 建議更新欄位 ─────────────────────────
+            st.markdown("📋 **建議更新的大貨表欄位**:")
+            for col in r["suggested_columns"]:
+                st.markdown(f"- {col}")
+
+            # ── 三個按鈕 ─────────────────────────────
+            b1, b2, b3 = st.columns(3)
+            with b1:
+                if st.button("✓ 已更新大貨表", key=f"upd_{r['msg_id']}",
+                             use_container_width=True):
+                    set_reminder_state(user, r["msg_id"], "updated")
+                    st.toast("✅ 已標記為已更新", icon="✅")
+                    st.rerun()
+            with b2:
+                st.markdown(
+                    f"<a href='{r['gmail_link']}' target='_blank' "
+                    f"style='display:block;text-align:center;padding:8px;"
+                    f"background:#fafafa;border:1px solid #dadce0;"
+                    f"border-radius:6px;text-decoration:none;color:#1a73e8;'>"
+                    f"📧 跳到原信</a>",
+                    unsafe_allow_html=True,
+                )
+            with b3:
+                if st.button("✗ 不需要(誤判)", key=f"dis_{r['msg_id']}",
+                             use_container_width=True):
+                    set_reminder_state(user, r["msg_id"], "dismissed")
+                    st.toast("已標記為誤判,以後不再提醒", icon="🚫")
+                    st.rerun()
+
+
 def show_main_dashboard():
     user = st.session_state["user"]
     user_email = user["email"]
@@ -1508,6 +1685,9 @@ def show_main_dashboard():
             st.session_state.pop("_attachment_stats", None)
             st.rerun()
         st.divider()
+
+    # 大貨表 Excel 更新提醒(Phase 1:demo 資料,Phase 2 接 AI)
+    render_excel_update_panel(user)
 
     if "pending_items" not in st.session_state:
         with st.spinner("📬 正在從你的 Gmail 抓取待回信件(30-90 秒,只發生一次)..."):
