@@ -592,15 +592,28 @@ def render_email_detail(item, user_name, user_first_name, summary_cache, display
     left_col, right_col = st.columns([1, 1])
 
     with left_col:
-        st.markdown("### ✏️ 可編輯區(改完按下方儲存,僅本次 session 有效)")
+        st.markdown("### ✏️ 可編輯區(改完按下方儲存到雲端,跨 session 保留)")
         with st.form(key=f"edit_{msg_id}", clear_on_submit=False):
             new_title = st.text_input("📄 標題", value=final_title)
             new_summary = st.text_area("📝 AI 摘要", value=display_summary, height=200)
             new_actions = st.text_area("🎯 待辦事項", value=display_actions, height=200)
-            if st.form_submit_button("💾 儲存(僅本次 session)", use_container_width=True):
+            if st.form_submit_button("💾 儲存到雲端", use_container_width=True):
+                # 1. 立即更新 session_state(本頁立刻反映新值,不等網路)
                 st.session_state[f"_saved_{msg_id}"] = {
                     "title": new_title, "summary": new_summary, "actions": new_actions,
                 }
+                # 2. 同步寫進 Firestore(跨 session 保留)
+                user_for_save = st.session_state.get("user", {})
+                ok, msg = save_edit_to_firestore(
+                    user_for_save, msg_id, new_title, new_summary, new_actions,
+                )
+                if ok:
+                    st.success(f"✅ {msg}(關 tab 再開還在)")
+                else:
+                    st.warning(
+                        f"⚠️ 雲端儲存失敗:{msg}。本次編輯仍會在 session 內保留,"
+                        "但關 tab 後會遺失。"
+                    )
                 st.rerun(scope="fragment")
 
     with right_col:
@@ -634,6 +647,130 @@ def render_email_detail(item, user_name, user_first_name, summary_cache, display
             label_visibility="collapsed", key=f"d_{msg_id}",
         )
         st.caption("✂️ 滑鼠選取 → ⌘+C 複製 → 開 Gmail Reply → ⌘+V 貼上")
+
+
+def get_firebase_id_token(user):
+    """把 Google id_token 換成 Firebase ID token(每 50 分鐘 cache 一次,避免每次儲存都重換)。
+
+    回傳 Firebase ID token 字串,失敗回 None。
+    """
+    cached = st.session_state.get("_firebase_id_token")
+    cached_at = st.session_state.get("_firebase_id_token_at", 0)
+    now_ts = datetime.now(timezone.utc).timestamp()
+    # Firebase ID token 1 小時過期,提前 10 分鐘 refresh
+    if cached and (now_ts - cached_at < 3000):
+        return cached
+
+    api_key = st.secrets.get("FIREBASE_WEB_API_KEY", "")
+    google_id_token = user.get("id_token", "")
+    if not api_key or not google_id_token:
+        return None
+
+    try:
+        resp = requests.post(
+            f"https://identitytoolkit.googleapis.com/v1/accounts:signInWithIdp?key={api_key}",
+            json={
+                "postBody": f"id_token={google_id_token}&providerId=google.com",
+                "requestUri": REDIRECT_URI,
+                "returnSecureToken": True,
+            },
+            timeout=10,
+        )
+        if not resp.ok:
+            return None
+        firebase_token = resp.json().get("idToken", "")
+        st.session_state["_firebase_id_token"] = firebase_token
+        st.session_state["_firebase_id_token_at"] = now_ts
+        return firebase_token
+    except Exception:
+        return None
+
+
+def save_edit_to_firestore(user, msg_id, title, summary, actions):
+    """把使用者編輯寫進 Firestore (users/{email}/edits/{msg_id})。
+
+    用 PATCH(updateMask)做 upsert:已存在就覆蓋指定欄位,不存在就建。
+    回傳 (success: bool, message: str)。
+    """
+    firebase_token = get_firebase_id_token(user)
+    if not firebase_token:
+        return False, "未取得 Firebase token(請重新登入)"
+
+    email = user.get("email", "")
+    if not email:
+        return False, "無使用者 email"
+
+    project_id = "trims-f8e4a"
+    # PATCH 端點 + updateMask 達成「upsert」(已存在則更新,不存在則建立)
+    url = (
+        f"https://firestore.googleapis.com/v1/projects/{project_id}"
+        f"/databases/(default)/documents/users/{email}/edits/{msg_id}"
+        "?updateMask.fieldPaths=title"
+        "&updateMask.fieldPaths=summary"
+        "&updateMask.fieldPaths=actions"
+        "&updateMask.fieldPaths=updated_at"
+    )
+    body = {"fields": {
+        "title": {"stringValue": title or ""},
+        "summary": {"stringValue": summary or ""},
+        "actions": {"stringValue": actions or ""},
+        "updated_at": {"stringValue": datetime.now(timezone.utc).isoformat()},
+    }}
+    try:
+        resp = requests.patch(
+            url,
+            headers={"Authorization": f"Bearer {firebase_token}"},
+            json=body, timeout=10,
+        )
+        if resp.ok:
+            return True, "已儲存到雲端"
+        return False, f"儲存失敗 HTTP {resp.status_code}"
+    except Exception as e:
+        return False, f"儲存例外:{e}"
+
+
+def load_edits_from_firestore(user):
+    """從 Firestore 撈這個 user 所有的編輯紀錄(users/{email}/edits/*)。
+
+    回傳 dict: { msg_id: {title, summary, actions, updated_at} }
+    Firestore 沒資料或失敗時回空 dict(不影響 dashboard 主功能)。
+    """
+    firebase_token = get_firebase_id_token(user)
+    if not firebase_token:
+        return {}
+
+    email = user.get("email", "")
+    if not email:
+        return {}
+
+    project_id = "trims-f8e4a"
+    url = (
+        f"https://firestore.googleapis.com/v1/projects/{project_id}"
+        f"/databases/(default)/documents/users/{email}/edits"
+    )
+    try:
+        resp = requests.get(
+            url,
+            headers={"Authorization": f"Bearer {firebase_token}"},
+            timeout=10,
+        )
+        if not resp.ok:
+            return {}
+        docs = resp.json().get("documents", [])
+        out = {}
+        for d in docs:
+            # name 格式: projects/.../documents/users/{email}/edits/{msg_id}
+            doc_msg_id = d.get("name", "").rsplit("/", 1)[-1]
+            fields = d.get("fields", {})
+            out[doc_msg_id] = {
+                "title": fields.get("title", {}).get("stringValue", ""),
+                "summary": fields.get("summary", {}).get("stringValue", ""),
+                "actions": fields.get("actions", {}).get("stringValue", ""),
+                "updated_at": fields.get("updated_at", {}).get("stringValue", ""),
+            }
+        return out
+    except Exception:
+        return {}
 
 
 def phase6_firestore_probe(user):
@@ -781,6 +918,23 @@ def show_main_dashboard():
                 st.info("可能是 token 過期,請登出重新登入。")
                 st.stop()
     items = st.session_state["pending_items"]
+
+    # 從 Firestore 載入這個 user 之前所有的編輯,merge 進 session_state
+    # (只在第一次進 dashboard 時跑一次,失敗也不擋使用)
+    if not st.session_state.get("_firestore_edits_loaded"):
+        cloud_edits = load_edits_from_firestore(user)
+        for edit_msg_id, edit_data in cloud_edits.items():
+            saved_key = f"_saved_{edit_msg_id}"
+            # 雲端有資料但 session 還沒載入 → 從雲端帶回來
+            if saved_key not in st.session_state:
+                st.session_state[saved_key] = {
+                    "title": edit_data.get("title", ""),
+                    "summary": edit_data.get("summary", ""),
+                    "actions": edit_data.get("actions", ""),
+                }
+        st.session_state["_firestore_edits_loaded"] = True
+        if cloud_edits:
+            st.toast(f"☁️ 已從雲端載入 {len(cloud_edits)} 筆之前的編輯", icon="✅")
 
     if not items:
         st.success("🎉 你的 Gmail 中目前沒有待回客戶信件,辛苦了!")
