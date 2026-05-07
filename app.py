@@ -39,6 +39,10 @@ NOISE_DOMAINS = ["blot.new", "cloudhq.net", "bolt.eu"]
 INTERNAL_DOMAIN = "ibiney.io"
 SEARCH_DAYS = 7
 BODY_MAX_CHARS = 3000
+# 整 thread 餵 Gemini 時,單封信內容上限(避免超大附件信吃光配額)
+THREAD_PER_MSG_CHARS = 1500
+# 整 thread 總上限(Gemini Flash context 1M tokens 雖然吃得下,但仍設保險閾值)
+THREAD_TOTAL_CHARS = 12000
 
 
 DEPARTMENT_MAP = {
@@ -281,6 +285,35 @@ def extract_plain_body(payload):
     return ""
 
 
+def build_thread_transcript(messages_meta):
+    """把整個 thread 串成一份「對話紀錄」文字,給 Gemini 做有完整脈絡的摘要。
+
+    每封信輸出格式:
+        [編號] From: <寄件者>  Date: <日期>
+        <內文(裁切到 THREAD_PER_MSG_CHARS)>
+
+    總長度若超過 THREAD_TOTAL_CHARS,從最舊的那幾封開始截掉,優先保留近期對話。
+    """
+    blocks = []
+    for idx, m in enumerate(messages_meta, start=1):
+        headers = {h["name"]: h["value"] for h in m.get("payload", {}).get("headers", [])}
+        from_h = headers.get("From", "(unknown)")
+        date_h = headers.get("Date", "")
+        body = extract_plain_body(m.get("payload", {}))
+        body = (body or "").strip()
+        if len(body) > THREAD_PER_MSG_CHARS:
+            body = body[:THREAD_PER_MSG_CHARS] + "...[truncated]"
+        blocks.append(f"[{idx}] From: {from_h}  Date: {date_h}\n{body}")
+    transcript = "\n\n---\n\n".join(blocks)
+    # 太長時砍最早的訊息,保留最近的
+    if len(transcript) > THREAD_TOTAL_CHARS:
+        while len(transcript) > THREAD_TOTAL_CHARS and len(blocks) > 1:
+            blocks.pop(0)
+            transcript = "\n\n---\n\n".join(blocks)
+        transcript = "[Note: earliest messages omitted to fit context]\n\n" + transcript
+    return transcript
+
+
 def fetch_pending_emails(creds_dict, current_user_email):
     creds = credentials_from_dict(creds_dict)
     service = build("gmail", "v1", credentials=creds, cache_discovery=False)
@@ -336,10 +369,14 @@ def fetch_pending_emails(creds_dict, current_user_email):
         is_today = last_msg["date"] >= today_start
         age_hours = int((now - last_msg["date"]).total_seconds() // 3600)
 
+        # 整個 thread 拼成完整對話紀錄,讓 Gemini 看到全部脈絡
+        thread_text = build_thread_transcript(messages_meta)
+
         items.append({
             "msg_id": last_msg["id"], "subject": last_msg["subject"],
             "from": last_msg["from"], "date": last_msg["date"],
-            "body": last_msg["body"], "is_unread": last_msg["is_unread"],
+            "body": last_msg["body"], "thread_text": thread_text,
+            "is_unread": last_msg["is_unread"],
             "is_today": is_today, "age_hours": age_hours,
         })
 
@@ -350,21 +387,30 @@ def fetch_pending_emails(creds_dict, current_user_email):
 
 
 @st.cache_data(ttl=86400, show_spinner=False)
-def gemini_summary_and_actions(msg_id, subject, body):
+def gemini_summary_and_actions(msg_id, subject, thread_text):
+    """根據完整 thread(而不只是最後一封)產出摘要 + 待辦。
+
+    cache key 包含 thread_text → 若 thread 多了一封新信,自動 re-summarize。
+    """
     prompt = (
-        "Analyze this business email and produce TWO sections in English. "
+        "You are analyzing an email THREAD (full conversation history below). "
+        "Produce TWO sections in English based on the WHOLE thread context, "
+        "but with the focus on what the LATEST external message asks for. "
         "Use EXACTLY this format with [---] as separator (no extra text outside):\n\n"
         "**Theme:** [a short clean title MAX 8 words, format: 'OrderNumber MainTopic']\n"
-        "- [Key point 1]\n- [Key point 2]\n- [Key point 3]\n\n"
+        "- [Key point 1 — must reflect thread context, not just last msg]\n"
+        "- [Key point 2 — include earlier commitments/dates if relevant]\n"
+        "- [Key point 3]\n\n"
         "[---]\n\n"
         "**🎯 What you need to do:**\n"
-        "1. [specific action you should take]\n"
+        "1. [specific action — consider what's already been promised earlier in thread]\n"
         "2. [another action if any]\n"
         "3. [another action if any]\n\n"
-        "**📅 Deadline:** [extract date from email, or \"Not specified\"]\n"
+        "**📅 Deadline:** [extract date from anywhere in thread, or \"Not specified\"]\n"
         "**👤 Awaiting your reply:** [the person waiting]\n"
-        "**📌 Context:** [one line of business context]\n\n"
-        f"Email Subject: {subject}\n\nEmail Body:\n{body[:BODY_MAX_CHARS]}"
+        "**📌 Context:** [one line including key history from earlier messages]\n\n"
+        f"Email Subject: {subject}\n\n"
+        f"=== Email Thread ===\n{thread_text}\n=== End of Thread ==="
     )
     resp = requests.post(
         GEMINI_API_URL,
@@ -388,15 +434,19 @@ def gemini_summary_and_actions(msg_id, subject, body):
         return "(摘要產生失敗)", ""
 
 
-def gemini_reply_draft(msg_id, subject, body, actions, sender_name, user_first_name):
+def gemini_reply_draft(msg_id, subject, thread_text, actions, sender_name, user_first_name):
+    """根據完整 thread 寫回信草稿,避免重述 thread 早期已討論過的內容。"""
     prompt = (
         f"Write a professional, concise English email reply on behalf of {user_first_name}. "
         f"Be friendly but business-appropriate. Sign off as \"Best regards,\\n{user_first_name}\".\n\n"
-        f"The customer ({sender_name}) wrote:\n---\n{body[:BODY_MAX_CHARS]}\n---\n\n"
-        f"Action items to communicate (already analyzed):\n{actions}\n\n"
+        f"You are replying to {sender_name}. Below is the FULL thread history — "
+        f"use it to avoid repeating what was already discussed and to maintain consistency "
+        f"with prior commitments.\n\n"
+        f"=== Email Thread ===\n{thread_text}\n=== End of Thread ===\n\n"
+        f"Action items to communicate (already analyzed from the whole thread):\n{actions}\n\n"
         "Write a reply that:\n"
-        "1. Acknowledges the customer briefly\n"
-        "2. Addresses the action items naturally\n"
+        "1. Acknowledges the latest message briefly\n"
+        "2. Addresses the action items naturally, referencing earlier thread context only when useful\n"
         "3. Confirms next steps and timing if mentioned\n"
         f"4. Ends with the sign-off above\n\n"
         "Output ONLY the email body text (no Subject line, no commentary, no markdown)."
@@ -424,7 +474,10 @@ def gemini_reply_draft(msg_id, subject, body, actions, sender_name, user_first_n
 def precompute_summaries(items):
     out = {}
     for it in items:
-        summary, actions = gemini_summary_and_actions(it["msg_id"], it["subject"], it["body"])
+        # 用整 thread(thread_text)而不是只有最後一封(body)— 讓 Gemini 看到完整脈絡
+        summary, actions = gemini_summary_and_actions(
+            it["msg_id"], it["subject"], it["thread_text"]
+        )
         out[it["msg_id"]] = {"summary": summary, "actions": actions, "theme": extract_theme(summary)}
     return out
 
@@ -563,8 +616,11 @@ def render_email_detail(item, user_name, user_first_name, summary_cache, display
     if st.button("✍️ 產生英文回信草稿", use_container_width=True, key=f"btn_{msg_id}"):
         with st.spinner("Gemini 寫回信中(10-20 秒)..."):
             sender_name = clean_sender(item["from"])
+            # 把整 thread 餵給草稿生成,避免回信跟早期討論不一致
+            thread_text_for_draft = item.get("thread_text", body)
             draft = gemini_reply_draft(
-                msg_id, subject, body, display_actions, sender_name, user_first_name
+                msg_id, subject, thread_text_for_draft, display_actions,
+                sender_name, user_first_name,
             )
         if draft:
             st.session_state[draft_key] = draft
