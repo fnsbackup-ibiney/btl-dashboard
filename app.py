@@ -39,9 +39,9 @@ NOISE_DOMAINS = ["blot.new", "cloudhq.net", "bolt.eu"]
 INTERNAL_DOMAIN = "ibiney.io"
 SEARCH_DAYS = 3
 BODY_MAX_CHARS = 3000
-# 整 thread 餵 Gemini 時,單封信內容上限(避免超大附件信吃光配額)
+# 整 thread 喂 Gemini 时,单封信内容上限(避免超大附件信吃光配额)
 THREAD_PER_MSG_CHARS = 1500
-# 整 thread 總上限(Gemini Flash context 1M tokens 雖然吃得下,但仍設保險閾值)
+# 整 thread 总上限(Gemini Flash context 1M tokens 虽然吃得下,但仍设保险阈值)
 THREAD_TOTAL_CHARS = 12000
 
 
@@ -138,12 +138,12 @@ def is_noise_domain(email):
 
 def format_age(hours):
     if hours < 1:
-        return "< 1 小時"
+        return "< 1 小时"
     if hours < 24:
-        return f"{hours} 小時"
+        return f"{hours} 小时"
     days = hours // 24
     rem = hours % 24
-    return f"{days} 天" if rem == 0 else f"{days} 天 {rem} 小時"
+    return f"{days} 天" if rem == 0 else f"{days} 天 {rem} 小时"
 
 
 def extract_theme(summary_text):
@@ -157,23 +157,23 @@ def extract_theme(summary_text):
 
 def extract_topic_key(text):
     """
-    從文字中抓「訂單編號 / 款號」,作為「同主題」配對的 key。
+    从文字中抓「订单编号 / 款号」,作为「同主题」配对的 key。
     例:'Re: SKY 80025 sample' → 'SKY-80025'
         'BRAX 06388 mockup'   → 'BRAX-06388'
         'updated PI for #2317' → 'NUM-2317'
-        '客戶問候' → None
+        '客户问候' → None
     """
     if not text:
         return None
     upper = str(text).upper()
-    # 主要模式:品牌前綴 + 4-6 位數字
+    # 主要模式:品牌前缀 + 4-6 位数字
     m = re.search(
         r"\b(SKY|BRAX|WH|YAN|BIN|FNS|BTL|FCL|HW|BX|FS|YT|YAN|MJ)[\s\-/]*(\d{4,6})\b",
         upper,
     )
     if m:
         return f"{m.group(1)}-{m.group(2)}"
-    # 備案:單獨的 5-6 位數字(避免 4 位被誤抓成年份)
+    # 备案:单独的 5-6 位数字(避免 4 位被误抓成年份)
     m = re.search(r"\b(\d{5,6})\b", upper)
     if m:
         return f"NUM-{m.group(1)}"
@@ -222,7 +222,7 @@ def exchange_code_for_token(code):
             "client_secret": CLIENT_SECRET,
             "scopes": OAUTH_SCOPES,
         },
-        # Phase 6 驗證用:Google id_token,後續可以拿來換 Firebase ID token
+        # Phase 6 验证用:Google id_token,后续可以拿来换 Firebase ID token
         "id_token": token_data.get("id_token", ""),
         "email": user_info.get("email", ""),
         "name": user_info.get("name", ""),
@@ -288,13 +288,13 @@ def extract_plain_body(payload):
 
 
 def build_thread_transcript(messages_meta):
-    """把整個 thread 串成一份「對話紀錄」文字,給 Gemini 做有完整脈絡的摘要。
+    """把整个 thread 串成一份「对话纪录」文字,给 Gemini 做有完整脉络的摘要。
 
-    每封信輸出格式:
-        [編號] From: <寄件者>  Date: <日期>
-        <內文(裁切到 THREAD_PER_MSG_CHARS)>
+    每封信输出格式:
+        [编号] From: <寄件者>  Date: <日期>
+        <内文(裁切到 THREAD_PER_MSG_CHARS)>
 
-    總長度若超過 THREAD_TOTAL_CHARS,從最舊的那幾封開始截掉,優先保留近期對話。
+    总长度若超过 THREAD_TOTAL_CHARS,从最旧的那几封开始截掉,优先保留近期对话。
     """
     blocks = []
     for idx, m in enumerate(messages_meta, start=1):
@@ -307,7 +307,7 @@ def build_thread_transcript(messages_meta):
             body = body[:THREAD_PER_MSG_CHARS] + "...[truncated]"
         blocks.append(f"[{idx}] From: {from_h}  Date: {date_h}\n{body}")
     transcript = "\n\n---\n\n".join(blocks)
-    # 太長時砍最早的訊息,保留最近的
+    # 太长时砍最早的讯息,保留最近的
     if len(transcript) > THREAD_TOTAL_CHARS:
         while len(transcript) > THREAD_TOTAL_CHARS and len(blocks) > 1:
             blocks.pop(0)
@@ -371,7 +371,7 @@ def fetch_pending_emails(creds_dict, current_user_email):
         is_today = last_msg["date"] >= today_start
         age_hours = int((now - last_msg["date"]).total_seconds() // 3600)
 
-        # 整個 thread 拼成完整對話紀錄,讓 Gemini 看到全部脈絡
+        # 整个 thread 拼成完整对话纪录,让 Gemini 看到全部脉络
         thread_text = build_thread_transcript(messages_meta)
 
         items.append({
@@ -390,9 +390,9 @@ def fetch_pending_emails(creds_dict, current_user_email):
 
 @st.cache_data(ttl=86400, show_spinner=False)
 def gemini_summary_and_actions(msg_id, subject, thread_text):
-    """根據完整 thread(而不只是最後一封)產出摘要 + 待辦。
+    """根据完整 thread(而不只是最后一封)产出摘要 + 待办。
 
-    cache key 包含 thread_text → 若 thread 多了一封新信,自動 re-summarize。
+    cache key 包含 thread_text → 若 thread 多了一封新信,自动 re-summarize。
     """
     prompt = (
         "You are analyzing an email THREAD (full conversation history below). "
@@ -426,18 +426,18 @@ def gemini_summary_and_actions(msg_id, subject, thread_text):
         timeout=60,
     )
     if not resp.ok:
-        return "(摘要產生失敗)", ""
+        return "(摘要产生失败)", ""
     try:
         parts = resp.json()["candidates"][0]["content"]["parts"]
         full_text = "".join(p.get("text", "") for p in parts).strip()
         sections = full_text.split("[---]")
         return sections[0].strip(), (sections[1].strip() if len(sections) > 1 else "")
     except (KeyError, IndexError):
-        return "(摘要產生失敗)", ""
+        return "(摘要产生失败)", ""
 
 
 def gemini_reply_draft(msg_id, subject, thread_text, actions, sender_name, user_first_name):
-    """根據完整 thread 寫回信草稿,避免重述 thread 早期已討論過的內容。"""
+    """根据完整 thread 写回信草稿,避免重述 thread 早期已讨论过的内容。"""
     prompt = (
         f"Write a professional, concise English email reply on behalf of {user_first_name}. "
         f"Be friendly but business-appropriate. Sign off as \"Best regards,\\n{user_first_name}\".\n\n"
@@ -476,7 +476,7 @@ def gemini_reply_draft(msg_id, subject, thread_text, actions, sender_name, user_
 def precompute_summaries(items):
     out = {}
     for it in items:
-        # 用整 thread(thread_text)而不是只有最後一封(body)— 讓 Gemini 看到完整脈絡
+        # 用整 thread(thread_text)而不是只有最后一封(body)— 让 Gemini 看到完整脉络
         summary, actions = gemini_summary_and_actions(
             it["msg_id"], it["subject"], it["thread_text"]
         )
@@ -486,12 +486,12 @@ def precompute_summaries(items):
 
 def compute_grouped_titles(items, summary_cache):
     """
-    判定哪些信是「同主題」(透過訂單編號配對),產出每封信的最終顯示標題。
+    判定哪些信是「同主题」(透过订单编号配对),产出每封信的最终显示标题。
 
-    邏輯:
-      1. 每封信抽出訂單編號(從原主旨 + AI Theme 找)
-      2. 計數:有多少信用同一個訂單編號
-      3. 若 ≥ 2 → 該組共用一個統一標題(訂單編號)
+    逻辑:
+      1. 每封信抽出订单编号(从原主旨 + AI Theme 找)
+      2. 计数:有多少信用同一个订单编号
+      3. 若 ≥ 2 → 该组共用一个统一标题(订单编号)
       4. 若 = 1 或 None → 保持原主旨
     """
     # Step 1:每封信的 topic key
@@ -499,28 +499,28 @@ def compute_grouped_titles(items, summary_cache):
     for it in items:
         cached = summary_cache.get(it["msg_id"], {})
         theme = cached.get("theme", "")
-        # 先看原主旨,沒抓到再看 AI theme
+        # 先看原主旨,没抓到再看 AI theme
         key = extract_topic_key(it["subject"]) or extract_topic_key(theme)
         topic_keys[it["msg_id"]] = key
 
-    # Step 2:計數
+    # Step 2:计数
     key_counts = Counter(k for k in topic_keys.values() if k)
 
-    # Step 3:給每封信派標題
+    # Step 3:给每封信派标题
     titles = {}
     for it in items:
         msg_id = it["msg_id"]
         key = topic_keys[msg_id]
         if key and key_counts[key] >= 2:
-            # 同主題的多封信 → 統一標題
+            # 同主题的多封信 → 统一标题
             if key.startswith("NUM-"):
-                titles[msg_id] = f"#{key[4:]} 相關信件"
+                titles[msg_id] = f"#{key[4:]} 相关信件"
             else:
                 # 例如 SKY-80025 → "SKY 80025"
                 brand, num = key.split("-", 1)
                 titles[msg_id] = f"{brand} {num}"
         else:
-            # 唯一主題或抓不到編號 → 保留原主旨
+            # 唯一主题或抓不到编号 → 保留原主旨
             titles[msg_id] = it["subject"]
     return titles, topic_keys, key_counts
 
@@ -531,19 +531,19 @@ st.set_page_config(page_title="BTL Email Monitor", page_icon="📧", layout="wid
 def show_login_page():
     st.title("📧 BTL Email Monitor")
     st.markdown("---")
-    st.markdown("### 請使用 ibiney.io Google 帳號登入")
+    st.markdown("### 请使用 ibiney.io Google 帐号登入")
     st.markdown(
-        "登入後,儀表板會顯示**你自己 Gmail 中**符合條件的客戶待回信件 + AI 摘要。"
+        "登入后,仪表板会显示**你自己 Gmail 中**符合条件的客户待回信件 + AI 摘要。"
     )
     auth_url = get_login_url()
     st.link_button("🔐 Sign in with Google", auth_url, type="primary")
-    st.caption("⚠️ 首次登入會看到「Google hasn't verified this app」警告 → 點 Advanced → Continue,因為這是 ibiney 公司內部 app。")
+    st.caption("⚠️ 首次登入会看到「Google hasn't verified this app」警告 → 点 Advanced → Continue,因为这是 ibiney 公司内部 app。")
 
 
 def _encode_session_marker(refresh_token, email):
-    """把 refresh_token + email 編成可放 URL 的短字串。
+    """把 refresh_token + email 编成可放 URL 的短字串。
 
-    refresh_token 不是密碼,但仍是敏感資訊;放 URL 算是 trade-off。
+    refresh_token 不是密码,但仍是敏感资讯;放 URL 算是 trade-off。
     用 base64 url-safe encoding 避免特殊字元。
     """
     import json as _json
@@ -552,7 +552,7 @@ def _encode_session_marker(refresh_token, email):
 
 
 def _decode_session_marker(marker):
-    """反向解碼。失敗回 None。"""
+    """反向解码。失败回 None。"""
     import json as _json
     try:
         decoded = base64.urlsafe_b64decode(marker.encode("ascii")).decode("utf-8")
@@ -563,10 +563,10 @@ def _decode_session_marker(marker):
 
 
 def _refresh_access_token(refresh_token):
-    """用 refresh_token 換新的 access_token + id_token。
+    """用 refresh_token 换新的 access_token + id_token。
 
-    Google OAuth refresh_token 不會過期(除非用戶撤銷),
-    所以可以一直用它來重新拿短期的 access_token。
+    Google OAuth refresh_token 不会过期(除非用户撤销),
+    所以可以一直用它来重新拿短期的 access_token。
     """
     try:
         resp = requests.post(
@@ -587,24 +587,24 @@ def _refresh_access_token(refresh_token):
 
 
 def restore_session_from_url():
-    """從 URL `?_s=...` 還原使用者 session(支援瀏覽器重新整理)。
+    """从 URL `?_s=...` 还原使用者 session(支援浏览器重新整理)。
 
     流程:
-    1. 看 URL 有沒有 `_s` 參數
+    1. 看 URL 有没有 `_s` 参数
     2. 解出 refresh_token + email
-    3. 用 refresh_token 換新 access_token
+    3. 用 refresh_token 换新 access_token
     4. 抓 user info(name / picture)
-    5. 寫進 session_state["user"]
+    5. 写进 session_state["user"]
     """
     qp = st.query_params
     if "_s" not in qp:
         return False
     if "user" in st.session_state:
-        return True  # 已經有了
+        return True  # 已经有了
 
     refresh_token, email = _decode_session_marker(qp["_s"])
     if not refresh_token or not email:
-        # marker 壞了,清掉它
+        # marker 坏了,清掉它
         try:
             del st.query_params["_s"]
         except Exception:
@@ -627,7 +627,7 @@ def restore_session_from_url():
     st.session_state["user"] = {
         "creds": {
             "token": token_data["access_token"],
-            "refresh_token": refresh_token,  # 保留,refresh_token 不會過期
+            "refresh_token": refresh_token,  # 保留,refresh_token 不会过期
             "token_uri": "https://oauth2.googleapis.com/token",
             "client_id": CLIENT_ID,
             "client_secret": CLIENT_SECRET,
@@ -648,11 +648,11 @@ def handle_oauth_callback():
     try:
         result = exchange_code_for_token(qp["code"])
         if not result["email"].lower().endswith("@" + INTERNAL_DOMAIN):
-            st.error(f"此系統僅限 @{INTERNAL_DOMAIN} 同事使用。你的帳號:{result['email']}")
+            st.error(f"此系统仅限 @{INTERNAL_DOMAIN} 同事使用。你的帐号:{result['email']}")
             st.stop()
         st.session_state["user"] = result
 
-        # 把 refresh_token + email 寫進 URL,讓重新整理時可以還原 session
+        # 把 refresh_token + email 写进 URL,让重新整理时可以还原 session
         rt = result.get("creds", {}).get("refresh_token", "")
         if rt:
             marker = _encode_session_marker(rt, result["email"])
@@ -662,7 +662,7 @@ def handle_oauth_callback():
             st.query_params.clear()
         st.rerun()
     except Exception as e:
-        st.error(f"登入失敗:{e}")
+        st.error(f"登入失败:{e}")
         st.stop()
 
 
@@ -691,7 +691,7 @@ def render_email_detail(item, user_name, user_first_name, summary_cache, display
             f"""
 <div style="background-color:#FFF8E1;border-left:6px solid #FFB300;
             padding:18px 24px;border-radius:6px;margin-bottom:20px;">
-<h4 style="margin-top:0;color:#E65100;">🎯 你該做的事(優先看!)</h4>
+<h4 style="margin-top:0;color:#E65100;">🎯 你该做的事(优先看!)</h4>
 <div style="font-size:15px;line-height:1.8;">{md_to_html(display_actions)}</div>
 </div>
             """,
@@ -701,46 +701,46 @@ def render_email_detail(item, user_name, user_first_name, summary_cache, display
     left_col, right_col = st.columns([1, 1])
 
     with left_col:
-        st.markdown("### ✏️ 可編輯區(改完按下方儲存到雲端,跨 session 保留)")
+        st.markdown("### ✏️ 可编辑区(改完按下方储存到云端,跨 session 保留)")
         with st.form(key=f"edit_{msg_id}", clear_on_submit=False):
-            new_title = st.text_input("📄 標題", value=final_title)
+            new_title = st.text_input("📄 标题", value=final_title)
             new_summary = st.text_area("📝 AI 摘要", value=display_summary, height=200)
-            new_actions = st.text_area("🎯 待辦事項", value=display_actions, height=200)
-            if st.form_submit_button("💾 儲存到雲端", use_container_width=True):
-                # 1. 立即更新 session_state(本頁立刻反映新值,不等網路)
+            new_actions = st.text_area("🎯 待办事项", value=display_actions, height=200)
+            if st.form_submit_button("💾 储存到云端", use_container_width=True):
+                # 1. 立即更新 session_state(本页立刻反映新值,不等网路)
                 st.session_state[f"_saved_{msg_id}"] = {
                     "title": new_title, "summary": new_summary, "actions": new_actions,
                 }
-                # 2. 同步寫進 Firestore(跨 session 保留)
+                # 2. 同步写进 Firestore(跨 session 保留)
                 user_for_save = st.session_state.get("user", {})
                 ok, msg = save_edit_to_firestore(
                     user_for_save, msg_id, new_title, new_summary, new_actions,
                 )
                 if ok:
-                    st.success(f"✅ {msg}(關 tab 再開還在)")
+                    st.success(f"✅ {msg}(关 tab 再开还在)")
                 else:
                     st.warning(
-                        f"⚠️ 雲端儲存失敗:{msg}。本次編輯仍會在 session 內保留,"
-                        "但關 tab 後會遺失。"
+                        f"⚠️ 云端储存失败:{msg}。本次编辑仍会在 session 内保留,"
+                        "但关 tab 后会遗失。"
                     )
                 st.rerun(scope="fragment")
 
     with right_col:
-        st.markdown("### 📧 信件內容(原文,僅供參考)")
+        st.markdown("### 📧 信件内容(原文,仅供参考)")
         st.text_area(
             "body", value=body, height=520, disabled=True, label_visibility="collapsed",
         )
 
     gmail_link = f"https://mail.google.com/mail/u/0/#inbox/{msg_id}"
-    st.markdown(f"[🔗 在 Gmail 中開啟原信]({gmail_link})")
+    st.markdown(f"[🔗 在 Gmail 中开启原信]({gmail_link})")
 
     st.divider()
-    st.markdown("### ✍️ AI 一鍵產生回信草稿")
+    st.markdown("### ✍️ AI 一键产生回信草稿")
     draft_key = f"_draft_{msg_id}"
-    if st.button("✍️ 產生英文回信草稿", use_container_width=True, key=f"btn_{msg_id}"):
-        with st.spinner("Gemini 寫回信中(10-20 秒)..."):
+    if st.button("✍️ 产生英文回信草稿", use_container_width=True, key=f"btn_{msg_id}"):
+        with st.spinner("Gemini 写回信中(10-20 秒)..."):
             sender_name = clean_sender(item["from"])
-            # 把整 thread 餵給草稿生成,避免回信跟早期討論不一致
+            # 把整 thread 喂给草稿生成,避免回信跟早期讨论不一致
             thread_text_for_draft = item.get("thread_text", body)
             draft = gemini_reply_draft(
                 msg_id, subject, thread_text_for_draft, display_actions,
@@ -750,23 +750,23 @@ def render_email_detail(item, user_name, user_first_name, summary_cache, display
             st.session_state[draft_key] = draft
             st.rerun(scope="fragment")
     if draft_key in st.session_state:
-        st.markdown("##### 📝 建議回信")
+        st.markdown("##### 📝 建议回信")
         st.text_area(
             "draft", value=st.session_state[draft_key], height=300,
             label_visibility="collapsed", key=f"d_{msg_id}",
         )
-        st.caption("✂️ 滑鼠選取 → ⌘+C 複製 → 開 Gmail Reply → ⌘+V 貼上")
+        st.caption("✂️ 滑鼠选取 → ⌘+C 复制 → 开 Gmail Reply → ⌘+V 贴上")
 
 
 def get_firebase_id_token(user):
-    """把 Google id_token 換成 Firebase ID token(每 50 分鐘 cache 一次,避免每次儲存都重換)。
+    """把 Google id_token 换成 Firebase ID token(每 50 分钟 cache 一次,避免每次储存都重换)。
 
-    回傳 Firebase ID token 字串,失敗回 None。
+    回传 Firebase ID token 字串,失败回 None。
     """
     cached = st.session_state.get("_firebase_id_token")
     cached_at = st.session_state.get("_firebase_id_token_at", 0)
     now_ts = datetime.now(timezone.utc).timestamp()
-    # Firebase ID token 1 小時過期,提前 10 分鐘 refresh
+    # Firebase ID token 1 小时过期,提前 10 分钟 refresh
     if cached and (now_ts - cached_at < 3000):
         return cached
 
@@ -796,21 +796,21 @@ def get_firebase_id_token(user):
 
 
 def save_edit_to_firestore(user, msg_id, title, summary, actions):
-    """把使用者編輯寫進 Firestore (users/{email}/edits/{msg_id})。
+    """把使用者编辑写进 Firestore (users/{email}/edits/{msg_id})。
 
-    用 PATCH(updateMask)做 upsert:已存在就覆蓋指定欄位,不存在就建。
-    回傳 (success: bool, message: str)。
+    用 PATCH(updateMask)做 upsert:已存在就覆盖指定栏位,不存在就建。
+    回传 (success: bool, message: str)。
     """
     firebase_token = get_firebase_id_token(user)
     if not firebase_token:
-        return False, "未取得 Firebase token(請重新登入)"
+        return False, "未取得 Firebase token(请重新登入)"
 
     email = user.get("email", "")
     if not email:
-        return False, "無使用者 email"
+        return False, "无使用者 email"
 
     project_id = "trims-f8e4a"
-    # PATCH 端點 + updateMask 達成「upsert」(已存在則更新,不存在則建立)
+    # PATCH 端点 + updateMask 达成「upsert」(已存在则更新,不存在则建立)
     url = (
         f"https://firestore.googleapis.com/v1/projects/{project_id}"
         f"/databases/(default)/documents/users/{email}/edits/{msg_id}"
@@ -832,17 +832,17 @@ def save_edit_to_firestore(user, msg_id, title, summary, actions):
             json=body, timeout=10,
         )
         if resp.ok:
-            return True, "已儲存到雲端"
-        return False, f"儲存失敗 HTTP {resp.status_code}"
+            return True, "已储存到云端"
+        return False, f"储存失败 HTTP {resp.status_code}"
     except Exception as e:
-        return False, f"儲存例外:{e}"
+        return False, f"储存例外:{e}"
 
 
 def load_edits_from_firestore(user):
-    """從 Firestore 撈這個 user 所有的編輯紀錄(users/{email}/edits/*)。
+    """从 Firestore 捞这个 user 所有的编辑纪录(users/{email}/edits/*)。
 
-    回傳 dict: { msg_id: {title, summary, actions, updated_at} }
-    Firestore 沒資料或失敗時回空 dict(不影響 dashboard 主功能)。
+    回传 dict: { msg_id: {title, summary, actions, updated_at} }
+    Firestore 没资料或失败时回空 dict(不影响 dashboard 主功能)。
     """
     firebase_token = get_firebase_id_token(user)
     if not firebase_token:
@@ -883,10 +883,10 @@ def load_edits_from_firestore(user):
 
 
 def analyze_attachments(creds_dict, current_user_email):
-    """掃描使用者過去 SEARCH_DAYS 天的待回 thread,統計附件分佈。
+    """扫描使用者过去 SEARCH_DAYS 天的待回 thread,统计附件分布。
 
-    產出 multi-modal PRD 需要的真實數據:附件類型、客戶分佈、業務話題分佈。
-    回傳 dict 結構,在 streamlit 端渲染成表格。
+    产出 multi-modal PRD 需要的真实数据:附件类型、客户分布、业务话题分布。
+    回传 dict 结构,在 streamlit 端渲染成表格。
     """
     creds = credentials_from_dict(creds_dict)
     service = build("gmail", "v1", credentials=creds, cache_discovery=False)
@@ -902,12 +902,12 @@ def analyze_attachments(creds_dict, current_user_email):
         "messages_with_attachments": 0,
         "messages_without_attachments": 0,
         "total_attachments": 0,
-        "mime_types": Counter(),       # 每個 MIME 類型計數
-        "file_extensions": Counter(),  # 副檔名計數
-        "client_attachments": Counter(),  # 客戶 → 附件數
-        "subject_keywords": Counter(),    # 主旨關鍵字
+        "mime_types": Counter(),       # 每个 MIME 类型计数
+        "file_extensions": Counter(),  # 副档名计数
+        "client_attachments": Counter(),  # 客户 → 附件数
+        "subject_keywords": Counter(),    # 主旨关键字
         "size_buckets": Counter(),     # 附件大小分布
-        "thread_with_attachment_count": 0,  # 多少 thread 至少有 1 個附件
+        "thread_with_attachment_count": 0,  # 多少 thread 至少有 1 个附件
     }
 
     business_words = [
@@ -933,12 +933,12 @@ def analyze_attachments(creds_dict, current_user_email):
             from_h = headers.get("From", "")
             subject = headers.get("Subject", "")
 
-            # 主旨關鍵字統計
+            # 主旨关键字统计
             for word in business_words:
                 if word.lower() in subject.lower():
                     stats["subject_keywords"][word] += 1
 
-            # 找附件:遞迴掃 payload.parts,filename 非空就是附件
+            # 找附件:递回扫 payload.parts,filename 非空就是附件
             attachments = []
             def walk_parts(payload):
                 if not payload:
@@ -965,11 +965,11 @@ def analyze_attachments(creds_dict, current_user_email):
                 for att in attachments:
                     mime = att["mime"]
                     stats["mime_types"][mime] += 1
-                    # 副檔名
+                    # 副档名
                     fname = att["filename"]
                     ext = fname.rsplit(".", 1)[-1].lower() if "." in fname else "(no_ext)"
                     stats["file_extensions"][ext] += 1
-                    # 客戶
+                    # 客户
                     stats["client_attachments"][client] += 1
                     # 大小分布
                     size = att["size"]
@@ -991,11 +991,11 @@ def analyze_attachments(creds_dict, current_user_email):
 
 
 def render_attachment_analysis(user):
-    """執行 + 渲染附件分析結果(PRD 證據用)。"""
-    st.markdown("### 📊 附件分析(Multi-modal PRD 數據收集)")
+    """执行 + 渲染附件分析结果(PRD 证据用)。"""
+    st.markdown("### 📊 附件分析(Multi-modal PRD 数据收集)")
     st.caption(
-        f"掃描你過去 {SEARCH_DAYS} 天 inbox 業務 thread 的附件分佈 — "
-        "這份數據會用來決定 multi-modal 該優先支援什麼檔案類型。"
+        f"扫描你过去 {SEARCH_DAYS} 天 inbox 业务 thread 的附件分布 — "
+        "这份数据会用来决定 multi-modal 该优先支援什么档案类型。"
     )
 
     if "_attachment_stats" not in st.session_state:
@@ -1005,20 +1005,20 @@ def render_attachment_analysis(user):
                     user["creds"], user["email"]
                 )
             except Exception as e:
-                st.error(f"分析失敗:{e}")
+                st.error(f"分析失败:{e}")
                 return
 
     stats = st.session_state["_attachment_stats"]
 
-    # ── 總覽 ──────────────────────────────────────────
+    # ── 总览 ──────────────────────────────────────────
     c1, c2, c3, c4 = st.columns(4)
-    c1.metric("掃描 Thread 數", stats["total_threads"])
-    c2.metric("總信件數", stats["total_messages"])
+    c1.metric("扫描 Thread 数", stats["total_threads"])
+    c2.metric("总信件数", stats["total_messages"])
     c3.metric("有附件的信", stats["messages_with_attachments"])
-    c4.metric("總附件數", stats["total_attachments"])
+    c4.metric("总附件数", stats["total_attachments"])
 
     if stats["total_messages"] == 0:
-        st.warning("沒有找到任何信件")
+        st.warning("没有找到任何信件")
         return
 
     # ── 附件密度 ──────────────────────────────────────
@@ -1026,80 +1026,80 @@ def render_attachment_analysis(user):
     pct_thread = round(100 * stats["thread_with_attachment_count"] / stats["total_threads"], 1)
     st.markdown(f"""
     **📌 附件密度**:
-    - 有附件的信佔 **{pct_with}%**({stats['messages_with_attachments']}/{stats['total_messages']})
-    - 有附件的 thread 佔 **{pct_thread}%**({stats['thread_with_attachment_count']}/{stats['total_threads']})
-    - 平均每封有附件的信 = **{round(stats['total_attachments'] / max(stats['messages_with_attachments'], 1), 2)} 個**附件
+    - 有附件的信占 **{pct_with}%**({stats['messages_with_attachments']}/{stats['total_messages']})
+    - 有附件的 thread 占 **{pct_thread}%**({stats['thread_with_attachment_count']}/{stats['total_threads']})
+    - 平均每封有附件的信 = **{round(stats['total_attachments'] / max(stats['messages_with_attachments'], 1), 2)} 个**附件
     """)
 
-    # ── 副檔名 Top 10 ────────────────────────────────
-    st.markdown("#### 📁 附件副檔名分佈(這個最關鍵 — 決定要支援哪些格式)")
+    # ── 副档名 Top 10 ────────────────────────────────
+    st.markdown("#### 📁 附件副档名分布(这个最关键 — 决定要支援哪些格式)")
     if stats["file_extensions"]:
         ext_df = pd.DataFrame(
             stats["file_extensions"].most_common(15),
-            columns=["副檔名", "出現次數"],
+            columns=["副档名", "出现次数"],
         )
-        ext_df["佔比"] = ext_df["出現次數"].apply(
+        ext_df["占比"] = ext_df["出现次数"].apply(
             lambda n: f"{round(100 * n / stats['total_attachments'], 1)}%"
         )
         st.dataframe(ext_df, use_container_width=True, hide_index=True)
     else:
-        st.info("沒有附件可分析")
+        st.info("没有附件可分析")
 
-    # ── MIME 類型 ────────────────────────────────────
-    st.markdown("#### 🔬 MIME 類型(技術精確版)")
+    # ── MIME 类型 ────────────────────────────────────
+    st.markdown("#### 🔬 MIME 类型(技术精确版)")
     if stats["mime_types"]:
         mime_df = pd.DataFrame(
             stats["mime_types"].most_common(15),
-            columns=["MIME", "次數"],
+            columns=["MIME", "次数"],
         )
         st.dataframe(mime_df, use_container_width=True, hide_index=True)
 
-    # ── 客戶分佈 ────────────────────────────────────
-    st.markdown("#### 🏢 哪些客戶最常寄附件?")
+    # ── 客户分布 ────────────────────────────────────
+    st.markdown("#### 🏢 哪些客户最常寄附件?")
     if stats["client_attachments"]:
         client_df = pd.DataFrame(
             stats["client_attachments"].most_common(10),
-            columns=["客戶", "附件數"],
+            columns=["客户", "附件数"],
         )
         st.dataframe(client_df, use_container_width=True, hide_index=True)
 
     # ── 附件大小 ───────────────────────────────────
-    st.markdown("#### 📦 附件大小分佈(影響 Gemini upload 時間)")
+    st.markdown("#### 📦 附件大小分布(影响 Gemini upload 时间)")
     if stats["size_buckets"]:
         size_df = pd.DataFrame(
             list(stats["size_buckets"].items()),
-            columns=["大小範圍", "個數"],
+            columns=["大小范围", "个数"],
         )
         st.dataframe(size_df, use_container_width=True, hide_index=True)
 
-    # ── 主旨關鍵字 ──────────────────────────────────
-    st.markdown("#### 💬 主旨業務關鍵字 Top 10(內容話題分佈)")
+    # ── 主旨关键字 ──────────────────────────────────
+    st.markdown("#### 💬 主旨业务关键字 Top 10(内容话题分布)")
     if stats["subject_keywords"]:
         kw_df = pd.DataFrame(
             stats["subject_keywords"].most_common(10),
-            columns=["關鍵字", "出現次數"],
+            columns=["关键字", "出现次数"],
         )
         st.dataframe(kw_df, use_container_width=True, hide_index=True)
 
-    # ── 給 PRD 的洞察 ───────────────────────────────
-    st.markdown("#### 💡 對 PRD 的初步洞察")
+    # ── 给 PRD 的洞察 ───────────────────────────────
+    st.markdown("#### 💡 对 PRD 的初步洞察")
     top_exts = stats["file_extensions"].most_common(3)
     if top_exts:
         top_summary = ", ".join([f"`.{e}` ({n})" for e, n in top_exts])
         st.info(
-            f"**Top 3 副檔名**:{top_summary}\n\n"
-            f"→ Multi-modal 第一階段建議優先支援:**{top_exts[0][0]}**"
-            f"({round(100 * top_exts[0][1] / stats['total_attachments'], 1)}% 涵蓋率)"
+            f"**Top 3 副档名**:{top_summary}\n\n"
+            f"→ Multi-modal 第一阶段建议优先支援:**{top_exts[0][0]}**"
+            f"({round(100 * top_exts[0][1] / stats['total_attachments'], 1)}% 涵盖率)"
         )
 
 
 def phase6_firestore_probe(user):
-    """Phase 6 驗證:測試 user OAuth token 能否寫入 Firestore。
+    """Phase 6 验证:测试 user OAuth token 能否写入 Firestore。
 
-    跑兩個 Plan:
+    跑两个 Plan:
     - Plan A:用 Google access_token 直接呼叫 Firestore REST API
-    - Plan B:用 Google id_token 換 Firebase ID token,再寫 Firestore
-    每個 Plan 寫一筆到 test_probe collection,印出 HTTP 狀態與回應。
+    - Plan B:用 Google id_token 换 Firebase ID token,再写 Firestore
+    每个 Plan 写一笔到 test_probe collection,印出 HTTP 状态与回应。
     """
     project_id = "trims-f8e4a"
     firebase_api_key = st.secrets.get("FIREBASE_WEB_API_KEY", "")
@@ -1108,13 +1108,13 @@ def phase6_firestore_probe(user):
     id_token = user.get("id_token", "")
     email = user.get("email", "")
 
-    st.markdown("### 🧪 Phase 6 — Firestore 寫入可行性驗證")
-    st.caption("測試會寫一筆到 `test_probe/<email>`,不影響正式資料。Rules 已限制只能 ibiney.io 寫入。")
+    st.markdown("### 🧪 Phase 6 — Firestore 写入可行性验证")
+    st.caption("测试会写一笔到 `test_probe/<email>`,不影响正式资料。Rules 已限制只能 ibiney.io 写入。")
 
     # ── Plan A:直接用 access_token 呼 Firestore REST ────────
     st.markdown("#### Plan A:Google access_token → Firestore REST")
     if not access_token:
-        st.error("找不到 access_token,請重新登入")
+        st.error("找不到 access_token,请重新登入")
     else:
         url_a = (
             f"https://firestore.googleapis.com/v1/projects/{project_id}"
@@ -1132,26 +1132,26 @@ def phase6_firestore_probe(user):
                 json=body_a, timeout=15,
             )
             st.write(f"HTTP **{resp_a.status_code}** {'✅ 可行' if resp_a.ok else '❌ 不通'}")
-            with st.expander("查看回應內容"):
+            with st.expander("查看回应内容"):
                 st.code(resp_a.text[:1500])
         except Exception as e:
             st.error(f"Plan A 例外:{e}")
 
     st.divider()
 
-    # ── Plan B:id_token 換 Firebase token → Firestore ───────
+    # ── Plan B:id_token 换 Firebase token → Firestore ───────
     st.markdown("#### Plan B:Google id_token → Firebase ID token → Firestore")
     if not id_token:
         st.warning(
-            "⚠️ 此 session 沒有 id_token(你登入是在加這個欄位之前)。\n\n"
-            "請按右上「🚪 登出」重新登入,新 session 才有 id_token,Plan B 才能測。"
+            "⚠️ 此 session 没有 id_token(你登入是在加这个栏位之前)。\n\n"
+            "请按右上「🚪 登出」重新登入,新 session 才有 id_token,Plan B 才能测。"
         )
     elif not firebase_api_key:
         st.warning(
-            "⚠️ Streamlit Secrets 沒設 `FIREBASE_WEB_API_KEY`。\n\n"
-            "Plan B 需要這個 key 才能呼叫 Firebase Identity Toolkit 換 token。\n"
+            "⚠️ Streamlit Secrets 没设 `FIREBASE_WEB_API_KEY`。\n\n"
+            "Plan B 需要这个 key 才能呼叫 Firebase Identity Toolkit 换 token。\n"
             "去 https://console.firebase.google.com/project/trims-f8e4a/settings/general → 看 Web API Key,"
-            "貼進 Streamlit Cloud → btl-dashboard → Settings → Secrets,新增:\n"
+            "贴进 Streamlit Cloud → btl-dashboard → Settings → Secrets,新增:\n"
             "`FIREBASE_WEB_API_KEY = \"...\"`"
         )
     else:
@@ -1168,7 +1168,7 @@ def phase6_firestore_probe(user):
             ex_resp = requests.post(exchange_url, json=exchange_body, timeout=15)
             if not ex_resp.ok:
                 st.write(f"Token exchange HTTP **{ex_resp.status_code}** ❌")
-                with st.expander("查看 exchange 失敗回應"):
+                with st.expander("查看 exchange 失败回应"):
                     st.code(ex_resp.text[:1500])
             else:
                 firebase_id_token = ex_resp.json().get("idToken", "")
@@ -1187,22 +1187,22 @@ def phase6_firestore_probe(user):
                     headers={"Authorization": f"Bearer {firebase_id_token}"},
                     json=body_b, timeout=15,
                 )
-                st.write(f"Firestore 寫入 HTTP **{resp_b.status_code}** {'✅ 可行' if resp_b.ok else '❌ 不通'}")
-                with st.expander("查看寫入回應"):
+                st.write(f"Firestore 写入 HTTP **{resp_b.status_code}** {'✅ 可行' if resp_b.ok else '❌ 不通'}")
+                with st.expander("查看写入回应"):
                     st.code(resp_b.text[:1500])
         except Exception as e:
             st.error(f"Plan B 例外:{e}")
 
 
 # ═══════════════════════════════════════════════════════════════
-# Quality Report:用客觀數據驗證「系統真的有效嗎」
+# Quality Report:用客观数据验证「系统真的有效吗」
 # ═══════════════════════════════════════════════════════════════
 
 def gemini_critique_summary(thread_text, ai_summary, ai_actions):
-    """讓另一個 Gemini call 扮演評審,評分既有的 AI 摘要 + 待辦。
+    """让另一个 Gemini call 扮演评审,评分既有的 AI 摘要 + 待办。
 
-    回傳 dict:{theme_score, bullets_score, actions_score, awaiting_correct, notes}
-    每個分數 1-5。失敗回 None。
+    回传 dict:{theme_score, bullets_score, actions_score, awaiting_correct, notes}
+    每个分数 1-5。失败回 None。
     """
     prompt = (
         "You are an expert evaluator. Below is an email thread and an AI-generated "
@@ -1245,10 +1245,10 @@ def gemini_critique_summary(thread_text, ai_summary, ai_actions):
 
 
 def fetch_all_business_threads(creds_dict, with_subjects=True):
-    """抓 SEARCH_DAYS 天內所有「主旨含業務關鍵字」的 thread,回傳 thread metadata list。
+    """抓 SEARCH_DAYS 天内所有「主旨含业务关键字」的 thread,回传 thread metadata list。
 
-    與 fetch_pending_emails 不同,這裡不套用「最後外部寄件者 + 我未回」過濾。
-    用來做雙向比對:看完整 universe 大小,跟 dashboard 顯示的差距。
+    与 fetch_pending_emails 不同,这里不套用「最后外部寄件者 + 我未回」过滤。
+    用来做双向比对:看完整 universe 大小,跟 dashboard 显示的差距。
     """
     creds = credentials_from_dict(creds_dict)
     service = build("gmail", "v1", credentials=creds, cache_discovery=False)
@@ -1268,7 +1268,7 @@ def fetch_all_business_threads(creds_dict, with_subjects=True):
         if not messages:
             continue
 
-        # 找最後一封外部 + 之後是否有當前 user 回覆
+        # 找最后一封外部 + 之后是否有当前 user 回复
         last_ext_from = None
         last_ext_idx = -1
         for i in range(len(messages) - 1, -1, -1):
@@ -1284,8 +1284,8 @@ def fetch_all_business_threads(creds_dict, with_subjects=True):
             for j in range(last_ext_idx + 1, len(messages)):
                 headers = {h["name"]: h["value"] for h in messages[j].get("payload", {}).get("headers", [])}
                 from_email = extract_email(headers.get("From", ""))
-                # 注意:這裡無法精確判斷「當前 user」是誰,因為這函式不傳 user_email
-                # 改成:看是不是 internal domain → 任一 ibiney 都算「我們有人回了」
+                # 注意:这里无法精确判断「当前 user」是谁,因为这函式不传 user_email
+                # 改成:看是不是 internal domain → 任一 ibiney 都算「我们有人回了」
                 if from_email and is_internal(from_email):
                     user_replied_after = True
                     break
@@ -1305,12 +1305,12 @@ def fetch_all_business_threads(creds_dict, with_subjects=True):
 
 
 def run_quality_report(user, sample_size=10):
-    """執行 4 大測試,產出 Quality Report dict。
+    """执行 4 大测试,产出 Quality Report dict。
 
-    Test A: 過濾邏輯雙向比對(universe vs dashboard)
-    Test B: AI 摘要 self-critique(隨機抽樣)
-    Test C: Last-external-sender 邏輯 confusion matrix
-    Test D: 速度與配額
+    Test A: 过滤逻辑双向比对(universe vs dashboard)
+    Test B: AI 摘要 self-critique(随机抽样)
+    Test C: Last-external-sender 逻辑 confusion matrix
+    Test D: 速度与配额
     """
     import time
     import random
@@ -1321,12 +1321,12 @@ def run_quality_report(user, sample_size=10):
         "search_days": SEARCH_DAYS,
     }
 
-    # ── Test A:過濾雙向比對 + Test C:邏輯 confusion ──
+    # ── Test A:过滤双向比对 + Test C:逻辑 confusion ──
     t_start = time.time()
     universe = fetch_all_business_threads(user["creds"], with_subjects=True)
     universe_secs = round(time.time() - t_start, 1)
 
-    # universe 中:有外部信 + 內部還沒回 = 應該顯示
+    # universe 中:有外部信 + 内部还没回 = 应该显示
     should_show = [u for u in universe
                    if u["has_external_message"]
                    and not u["internal_replied_after_external"]]
@@ -1336,12 +1336,12 @@ def run_quality_report(user, sample_size=10):
 
     items = st.session_state.get("pending_items", [])
     shown_thread_ids = set()
-    # pending_items 沒存 thread_id,改用 msg_id 對 last 一封 → 反查 universe 裡的 thread
-    # 這裡放寬:用 last_external_from + subject 比對
+    # pending_items 没存 thread_id,改用 msg_id 对 last 一封 → 反查 universe 里的 thread
+    # 这里放宽:用 last_external_from + subject 比对
     shown_subjects = {(it["subject"], extract_email(it["from"])): it for it in items}
 
     matched_show = 0
-    missed_show = []  # 應該顯示但沒顯示
+    missed_show = []  # 应该显示但没显示
     for u in should_show:
         key = (u["last_subject"], extract_email(u["last_external_from"] or ""))
         if key in shown_subjects:
@@ -1349,7 +1349,7 @@ def run_quality_report(user, sample_size=10):
         else:
             missed_show.append(u)
 
-    false_positive = []  # 顯示了但 universe 認為不該
+    false_positive = []  # 显示了但 universe 认为不该
     should_hide_keys = {(u["last_subject"], extract_email(u["last_external_from"] or "")): u
                         for u in should_hide}
     for k, _ in shown_subjects.items():
@@ -1420,23 +1420,23 @@ def run_quality_report(user, sample_size=10):
         }
     else:
         report["test_b"] = {
-            "sample_size": 0, "note": "沒有可評估的摘要(可能 dashboard 還沒抓信)"
+            "sample_size": 0, "note": "没有可评估的摘要(可能 dashboard 还没抓信)"
         }
 
-    # ── Test C:Confusion matrix(基於 universe vs dashboard 對照) ──
-    tp = matched_show                         # 該顯示且顯示
-    fn = len(missed_show)                     # 該顯示但沒顯示
-    fp = len(false_positive)                  # 不該顯示卻顯示
-    tn = len(should_hide) - fp                # 不該顯示也沒顯示
+    # ── Test C:Confusion matrix(基于 universe vs dashboard 对照) ──
+    tp = matched_show                         # 该显示且显示
+    fn = len(missed_show)                     # 该显示但没显示
+    fp = len(false_positive)                  # 不该显示却显示
+    tn = len(should_hide) - fp                # 不该显示也没显示
     report["test_c"] = {
         "true_positive": tp, "false_negative": fn,
         "false_positive": fp, "true_negative": max(tn, 0),
         "f1_score": round(2 * precision * recall / max(precision + recall, 1), 1),
     }
 
-    # ── Test D:速度 / 配額 ──
+    # ── Test D:速度 / 配额 ──
     n_items = len(items)
-    # 估算:每封信摘要約 0.7 ~ 1.5 token-burst,平均約 1 call/封
+    # 估算:每封信摘要约 0.7 ~ 1.5 token-burst,平均约 1 call/封
     estimated_calls_today = n_items + len(critiques)
     GEMINI_FREE_QUOTA = 1500
     est_5_user = estimated_calls_today * 5
@@ -1456,41 +1456,41 @@ def run_quality_report(user, sample_size=10):
 
 
 def render_quality_report(user):
-    """執行並顯示 Quality Report。"""
-    st.markdown("### 📋 Quality Report — 系統正確性驗證")
+    """执行并显示 Quality Report。"""
+    st.markdown("### 📋 Quality Report — 系统正确性验证")
     st.caption(
-        "對 dashboard 做 4 項客觀驗證:過濾正確性、AI 摘要品質、邏輯壓力測試、速度與配額。"
-        " 產出可量化的指標,作為「系統實際有效」的客觀證據。"
+        "对 dashboard 做 4 项客观验证:过滤正确性、AI 摘要品质、逻辑压力测试、速度与配额。"
+        " 产出可量化的指标,作为「系统实际有效」的客观证据。"
     )
 
     if "_quality_report" not in st.session_state:
         if "pending_items" not in st.session_state:
-            st.warning("請先讓 dashboard 抓完信件再跑 Quality Report")
+            st.warning("请先让 dashboard 抓完信件再跑 Quality Report")
             return
-        with st.spinner("⏳ 跑驗證中(可能花 30-60 秒,會多用 ~10 次 Gemini 呼叫)..."):
+        with st.spinner("⏳ 跑验证中(可能花 30-60 秒,会多用 ~10 次 Gemini 呼叫)..."):
             st.session_state["_quality_report"] = run_quality_report(user)
 
     report = st.session_state["_quality_report"]
 
-    # ── Test A:過濾正確性 ──
+    # ── Test A:过滤正确性 ──
     a = report.get("test_a", {})
-    st.markdown("#### 1️⃣ 過濾邏輯正確性(Precision / Recall)")
+    st.markdown("#### 1️⃣ 过滤逻辑正确性(Precision / Recall)")
     c1, c2, c3 = st.columns(3)
-    c1.metric("精準率 Precision", f"{a.get('precision_pct', 0)}%",
-              help="dashboard 顯示的信中有多少確實該回")
+    c1.metric("精准率 Precision", f"{a.get('precision_pct', 0)}%",
+              help="dashboard 显示的信中有多少确实该回")
     c2.metric("召回率 Recall", f"{a.get('recall_pct', 0)}%",
-              help="該顯示的信有多少被顯示")
+              help="该显示的信有多少被显示")
     c3.metric("F1 Score", f"{report.get('test_c', {}).get('f1_score', 0)}",
-              help="精準率與召回率的調和平均")
+              help="精准率与召回率的调和平均")
 
     a_summary = pd.DataFrame([
-        ["業務 thread 全集大小", a.get("universe_size", 0)],
-        ["邏輯上應該顯示", a.get("should_show_count", 0)],
-        ["dashboard 實際顯示", a.get("dashboard_shown_count", 0)],
-        ["匹配上(該顯示且顯示)", a.get("matched", 0)],
-        ["漏掉(該顯示沒顯示)", a.get("missed", 0)],
-        ["誤判(顯示但不該)", a.get("false_positive", 0)],
-    ], columns=["項目", "數量"])
+        ["业务 thread 全集大小", a.get("universe_size", 0)],
+        ["逻辑上应该显示", a.get("should_show_count", 0)],
+        ["dashboard 实际显示", a.get("dashboard_shown_count", 0)],
+        ["匹配上(该显示且显示)", a.get("matched", 0)],
+        ["漏掉(该显示没显示)", a.get("missed", 0)],
+        ["误判(显示但不该)", a.get("false_positive", 0)],
+    ], columns=["项目", "数量"])
     st.dataframe(a_summary, use_container_width=True, hide_index=True)
 
     if a.get("missed_examples"):
@@ -1498,68 +1498,68 @@ def render_quality_report(user):
             for ex in a["missed_examples"]:
                 st.markdown(f"- **{ex['subject']}** — from {ex['from']}")
 
-    # ── Test B:AI 品質 ──
+    # ── Test B:AI 品质 ──
     b = report.get("test_b", {})
-    st.markdown("#### 2️⃣ AI 摘要品質(Gemini self-critique 評分,1-5)")
+    st.markdown("#### 2️⃣ AI 摘要品质(Gemini self-critique 评分,1-5)")
     if b.get("sample_size", 0) > 0:
         c1, c2, c3, c4 = st.columns(4)
-        c1.metric("Theme 準確度", f"{b['avg_theme_score']} / 5")
-        c2.metric("Bullets 準確度", f"{b['avg_bullets_score']} / 5")
+        c1.metric("Theme 准确度", f"{b['avg_theme_score']} / 5")
+        c2.metric("Bullets 准确度", f"{b['avg_bullets_score']} / 5")
         c3.metric("Actions 可行度", f"{b['avg_actions_score']} / 5")
-        c4.metric("Awaiting 正確", f"{b['avg_awaiting_correct']} / 5")
-        st.caption(f"樣本數:{b['sample_size']} 封 / 評估耗時 {b.get('critique_time_secs', 0)} 秒")
+        c4.metric("Awaiting 正确", f"{b['avg_awaiting_correct']} / 5")
+        st.caption(f"样本数:{b['sample_size']} 封 / 评估耗时 {b.get('critique_time_secs', 0)} 秒")
 
         if b.get("weak_examples"):
-            with st.expander("⚠️ 主要弱點(評審指出的問題)"):
+            with st.expander("⚠️ 主要弱点(评审指出的问题)"):
                 for note in b["weak_examples"]:
                     st.markdown(f"- {note}")
     else:
-        st.info(b.get("note", "沒有可評估的摘要"))
+        st.info(b.get("note", "没有可评估的摘要"))
 
     # ── Test C:Confusion ──
     c = report.get("test_c", {})
-    st.markdown("#### 3️⃣ 邏輯壓力測試(Confusion Matrix)")
+    st.markdown("#### 3️⃣ 逻辑压力测试(Confusion Matrix)")
     cm = pd.DataFrame([
-        ["**該顯示**", c.get("true_positive", 0), c.get("false_negative", 0)],
-        ["**不該顯示**", c.get("false_positive", 0), c.get("true_negative", 0)],
-    ], columns=["實際情況 / 預測", "✅ 顯示了", "❌ 沒顯示"])
+        ["**该显示**", c.get("true_positive", 0), c.get("false_negative", 0)],
+        ["**不该显示**", c.get("false_positive", 0), c.get("true_negative", 0)],
+    ], columns=["实际情况 / 预测", "✅ 显示了", "❌ 没显示"])
     st.dataframe(cm, use_container_width=True, hide_index=True)
 
-    # ── Test D:速度配額 ──
+    # ── Test D:速度配额 ──
     d = report.get("test_d", {})
-    st.markdown("#### 4️⃣ 速度與配額")
+    st.markdown("#### 4️⃣ 速度与配额")
     d_df = pd.DataFrame([
-        ["抓 Gmail 全集耗時", f"{d.get('fetch_universe_secs', 0)} 秒"],
-        ["dashboard 顯示信數", d.get("items_in_dashboard", 0)],
-        ["評估摘要耗時", f"{d.get('summary_critique_secs', 0)} 秒"],
-        ["當天 Gemini 呼叫數(1 人)", d.get("estimated_gemini_calls_today_1user", 0)],
-        ["當天 Gemini 呼叫數(估算 5 人)", d.get("estimated_gemini_calls_today_5users", 0)],
-        ["免費額度", d.get("free_quota_per_day", 1500)],
-        ["5 人並用配額占比", f"{d.get('quota_usage_5user_pct', 0)}%"],
-        ["配額是否安全", "✅ 是" if d.get("quota_safe") else "❌ 會撞牆"],
-    ], columns=["指標", "數值"])
+        ["抓 Gmail 全集耗时", f"{d.get('fetch_universe_secs', 0)} 秒"],
+        ["dashboard 显示信数", d.get("items_in_dashboard", 0)],
+        ["评估摘要耗时", f"{d.get('summary_critique_secs', 0)} 秒"],
+        ["当天 Gemini 呼叫数(1 人)", d.get("estimated_gemini_calls_today_1user", 0)],
+        ["当天 Gemini 呼叫数(估算 5 人)", d.get("estimated_gemini_calls_today_5users", 0)],
+        ["免费额度", d.get("free_quota_per_day", 1500)],
+        ["5 人并用配额占比", f"{d.get('quota_usage_5user_pct', 0)}%"],
+        ["配额是否安全", "✅ 是" if d.get("quota_safe") else "❌ 会撞墙"],
+    ], columns=["指标", "数值"])
     st.dataframe(d_df, use_container_width=True, hide_index=True)
 
-    # ── 整體結論 ──
-    st.markdown("#### 🎯 整體結論(可複製貼到報告 / 訊息)")
+    # ── 整体结论 ──
+    st.markdown("#### 🎯 整体结论(可复制贴到报告 / 讯息)")
     verdict = (
         f"**BTL Email Monitor Quality Report — {report['ts'][:10]}**\n\n"
-        f"- 過濾正確性:Precision **{a.get('precision_pct', 0)}%** / Recall **{a.get('recall_pct', 0)}%** "
+        f"- 过滤正确性:Precision **{a.get('precision_pct', 0)}%** / Recall **{a.get('recall_pct', 0)}%** "
         f"(F1 = {c.get('f1_score', 0)})\n"
-        f"- AI 摘要品質(N={b.get('sample_size', 0)} 樣本):"
+        f"- AI 摘要品质(N={b.get('sample_size', 0)} 样本):"
         f"Theme {b.get('avg_theme_score', 'N/A')}/5、"
         f"Bullets {b.get('avg_bullets_score', 'N/A')}/5、"
         f"Actions {b.get('avg_actions_score', 'N/A')}/5、"
-        f"Awaiting 判斷 {b.get('avg_awaiting_correct', 'N/A')}/5\n"
+        f"Awaiting 判断 {b.get('avg_awaiting_correct', 'N/A')}/5\n"
         f"- Confusion: TP={c.get('true_positive', 0)}, "
         f"FN={c.get('false_negative', 0)}, FP={c.get('false_positive', 0)}, "
         f"TN={c.get('true_negative', 0)}\n"
         f"- 速度:抓信 {d.get('fetch_universe_secs', 0)} 秒,"
-        f"5 人並用估佔配額 {d.get('quota_usage_5user_pct', 0)}%\n"
-        f"- 結論:{'✅ 系統運作正常,可進入下一階段' if (a.get('precision_pct', 0) >= 80 and (b.get('avg_theme_score', 0) or 0) >= 3.5) else '⚠️ 有改進空間'}\n"
+        f"5 人并用估占配额 {d.get('quota_usage_5user_pct', 0)}%\n"
+        f"- 结论:{'✅ 系统运作正常,可进入下一阶段' if (a.get('precision_pct', 0) >= 80 and (b.get('avg_theme_score', 0) or 0) >= 3.5) else '⚠️ 有改进空间'}\n"
     )
     st.code(verdict, language="markdown")
-    st.caption("👆 全選複製這段,可貼到工作群組或報告。")
+    st.caption("👆 全选复制这段,可贴到工作群组或报告。")
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -1628,52 +1628,52 @@ SAMPLE_EXCEL_REMINDERS = [
 
 
 def get_reminder_state(user, msg_id):
-    """讀取一筆 reminder 的狀態(updated / dismissed / 無紀錄)。
+    """读取一笔 reminder 的状态(updated / dismissed / 无纪录)。
 
-    Phase 1:暫用 session_state。Phase 2 整合時改成讀 Firestore
+    Phase 1:暂用 session_state。Phase 2 整合时改成读 Firestore
     users/{email}/reminders/{msg_id}。
     """
     return st.session_state.get(f"_reminder_state_{msg_id}", "pending")
 
 
 def set_reminder_state(user, msg_id, state):
-    """標記 reminder 狀態:updated / dismissed / pending"""
+    """标记 reminder 状态:updated / dismissed / pending"""
     st.session_state[f"_reminder_state_{msg_id}"] = state
-    # TODO Phase 2:同步寫進 Firestore reminders/{msg_id}
+    # TODO Phase 2:同步写进 Firestore reminders/{msg_id}
 
 
 def render_excel_update_panel(user, reminders=None):
-    """頂部面板 — 顯示「需要更新大貨表」的提醒清單。
+    """顶部面板 — 显示「需要更新大货表」的提醒清单。
 
-    系統絕不直接改 Excel,只負責提醒人工去更新。
+    系统绝不直接改 Excel,只负责提醒人工去更新。
     """
     if reminders is None:
         reminders = SAMPLE_EXCEL_REMINDERS  # Phase 1 demo data
 
-    # 過濾掉已標記 updated 或 dismissed 的
+    # 过滤掉已标记 updated 或 dismissed 的
     pending = [r for r in reminders
                if get_reminder_state(user, r["msg_id"]) == "pending"]
 
     if not pending:
-        return  # 沒有 pending 的就不顯示
+        return  # 没有 pending 的就不显示
 
     high = [r for r in pending if r["confidence"] == "high"]
     medium = [r for r in pending if r["confidence"] == "medium"]
 
     with st.expander(
-        f"📊 大貨表 Excel 待更新項目 ({len(pending)} 筆) "
-        f"— 🔴 明確變動 {len(high)} / 🟡 可能需要變動 {len(medium)}",
+        f"📊 大货表 Excel 待更新项目 ({len(pending)} 笔) "
+        f"— 🔴 明确变动 {len(high)} / 🟡 可能需要变动 {len(medium)}",
         expanded=False,
     ):
         st.caption(
-            "🛡️ **系統永遠不會直接修改你的 Excel** — "
-            "以下項目是 AI 偵測到客戶在信件中 confirm / 變更 / 留下 comment,"
-            "建議你手動去更新大貨表。"
+            "🛡️ **系统永远不会直接修改你的 Excel** — "
+            "以下项目是 AI 侦测到客户在信件中 confirm / 变更 / 留下 comment,"
+            "建议你手动去更新大货表。"
         )
 
         for idx, r in enumerate(pending):
             confidence_emoji = "🔴" if r["confidence"] == "high" else "🟡"
-            confidence_text = "明確變動" if r["confidence"] == "high" else "可能需要變動"
+            confidence_text = "明确变动" if r["confidence"] == "high" else "可能需要变动"
 
             st.markdown("---")
             st.markdown(
@@ -1683,14 +1683,14 @@ def render_excel_update_panel(user, reminders=None):
                 unsafe_allow_html=True,
             )
 
-            # ── 信件來源 ─────────────────────────────────
+            # ── 信件来源 ─────────────────────────────────
             st.markdown(
                 f"📧 **{r['email_subject']}**  \n"
                 f"👤 {r['from']}   📅 {r['email_date']}"
             )
 
             # ── 原信原文片段(灰底引用框) ─────────────
-            st.markdown("📝 **客戶說了什麼**:")
+            st.markdown("📝 **客户说了什么**:")
             st.markdown(
                 f"<div style='background:#f1f3f4;border-left:4px solid #1a73e8;"
                 f"padding:10px 14px;border-radius:4px;color:#444;"
@@ -1699,13 +1699,13 @@ def render_excel_update_panel(user, reminders=None):
                 unsafe_allow_html=True,
             )
 
-            # ── 三個按鈕 ─────────────────────────────
+            # ── 三个按钮 ─────────────────────────────
             b1, b2, b3 = st.columns(3)
             with b1:
-                if st.button("✓ 已更新大貨表", key=f"upd_{r['msg_id']}",
+                if st.button("✓ 已更新大货表", key=f"upd_{r['msg_id']}",
                              use_container_width=True):
                     set_reminder_state(user, r["msg_id"], "updated")
-                    st.toast("✅ 已標記為已更新", icon="✅")
+                    st.toast("✅ 已标记为已更新", icon="✅")
                     st.rerun()
             with b2:
                 st.markdown(
@@ -1717,10 +1717,10 @@ def render_excel_update_panel(user, reminders=None):
                     unsafe_allow_html=True,
                 )
             with b3:
-                if st.button("✗ 不需要(誤判)", key=f"dis_{r['msg_id']}",
+                if st.button("✗ 不需要(误判)", key=f"dis_{r['msg_id']}",
                              use_container_width=True):
                     set_reminder_state(user, r["msg_id"], "dismissed")
-                    st.toast("已標記為誤判,以後不再提醒", icon="🚫")
+                    st.toast("已标记为误判,以后不再提醒", icon="🚫")
                     st.rerun()
 
 
@@ -1733,7 +1733,7 @@ def show_main_dashboard():
     title_col, user_col = st.columns([4, 1])
     with title_col:
         st.title("📧 BTL Email Monitor")
-        st.caption(f"已登入:{user_name} ({user_email}) / 顯示你 Gmail 中過去 {SEARCH_DAYS} 天的待回客戶信件")
+        st.caption(f"已登入:{user_name} ({user_email}) / 显示你 Gmail 中过去 {SEARCH_DAYS} 天的待回客户信件")
     with user_col:
         st.write("")
         if st.button("🔄 重新抓取", use_container_width=True):
@@ -1746,12 +1746,12 @@ def show_main_dashboard():
             st.query_params.clear()
             st.rerun()
 
-    # 開發/PRD 用工具(收在 expander 裡,不影響日常使用)
-    with st.sidebar.expander("🧪 開發工具"):
-        if st.button("📋 Quality Report(系統驗證)"):
+    # 开发/PRD 用工具(收在 expander 里,不影响日常使用)
+    with st.sidebar.expander("🧪 开发工具"):
+        if st.button("📋 Quality Report(系统验证)"):
             st.session_state["_quality_check"] = True
             st.session_state.pop("_quality_report", None)  # 重新跑
-        if st.button("Phase 6 Firestore 寫入測試"):
+        if st.button("Phase 6 Firestore 写入测试"):
             st.session_state["_phase6_probe"] = True
         if st.button("📊 附件分析(PRD 用)"):
             st.session_state["_attachment_analysis"] = True
@@ -1759,7 +1759,7 @@ def show_main_dashboard():
 
     if st.session_state.get("_quality_check"):
         render_quality_report(user)
-        if st.button("關閉 Quality Report"):
+        if st.button("关闭 Quality Report"):
             st.session_state.pop("_quality_check", None)
             st.session_state.pop("_quality_report", None)
             st.rerun()
@@ -1767,41 +1767,41 @@ def show_main_dashboard():
 
     if st.session_state.get("_phase6_probe"):
         phase6_firestore_probe(user)
-        if st.button("關閉驗證面板"):
+        if st.button("关闭验证面板"):
             st.session_state.pop("_phase6_probe", None)
             st.rerun()
         st.divider()
 
     if st.session_state.get("_attachment_analysis"):
         render_attachment_analysis(user)
-        if st.button("關閉附件分析面板"):
+        if st.button("关闭附件分析面板"):
             st.session_state.pop("_attachment_analysis", None)
             st.session_state.pop("_attachment_stats", None)
             st.rerun()
         st.divider()
 
-    # 大貨表 Excel 更新提醒(Phase 1:demo 資料,Phase 2 接 AI)
+    # 大货表 Excel 更新提醒(Phase 1:demo 资料,Phase 2 接 AI)
     render_excel_update_panel(user)
 
     if "pending_items" not in st.session_state:
-        with st.spinner("📬 正在從你的 Gmail 抓取待回信件(30-90 秒,只發生一次)..."):
+        with st.spinner("📬 正在从你的 Gmail 抓取待回信件(30-90 秒,只发生一次)..."):
             try:
                 st.session_state["pending_items"] = fetch_pending_emails(
                     user["creds"], user_email
                 )
             except Exception as e:
-                st.error(f"抓取 Gmail 失敗:{e}")
-                st.info("可能是 token 過期,請登出重新登入。")
+                st.error(f"抓取 Gmail 失败:{e}")
+                st.info("可能是 token 过期,请登出重新登入。")
                 st.stop()
     items = st.session_state["pending_items"]
 
-    # 從 Firestore 載入這個 user 之前所有的編輯,merge 進 session_state
-    # (只在第一次進 dashboard 時跑一次,失敗也不擋使用)
+    # 从 Firestore 载入这个 user 之前所有的编辑,merge 进 session_state
+    # (只在第一次进 dashboard 时跑一次,失败也不挡使用)
     if not st.session_state.get("_firestore_edits_loaded"):
         cloud_edits = load_edits_from_firestore(user)
         for edit_msg_id, edit_data in cloud_edits.items():
             saved_key = f"_saved_{edit_msg_id}"
-            # 雲端有資料但 session 還沒載入 → 從雲端帶回來
+            # 云端有资料但 session 还没载入 → 从云端带回来
             if saved_key not in st.session_state:
                 st.session_state[saved_key] = {
                     "title": edit_data.get("title", ""),
@@ -1810,10 +1810,10 @@ def show_main_dashboard():
                 }
         st.session_state["_firestore_edits_loaded"] = True
         if cloud_edits:
-            st.toast(f"☁️ 已從雲端載入 {len(cloud_edits)} 筆之前的編輯", icon="✅")
+            st.toast(f"☁️ 已从云端载入 {len(cloud_edits)} 笔之前的编辑", icon="✅")
 
     if not items:
-        st.success("🎉 你的 Gmail 中目前沒有待回客戶信件,辛苦了!")
+        st.success("🎉 你的 Gmail 中目前没有待回客户信件,辛苦了!")
         return
 
     if "summary_cache_for_table" not in st.session_state:
@@ -1821,55 +1821,55 @@ def show_main_dashboard():
             st.session_state["summary_cache_for_table"] = precompute_summaries(items)
     summary_cache = st.session_state["summary_cache_for_table"]
 
-    # 分組計算每封信的最終顯示標題
+    # 分组计算每封信的最终显示标题
     grouped_titles, topic_keys, key_counts = compute_grouped_titles(items, summary_cache)
 
-    # 統計分組情況
+    # 统计分组情况
     grouped_count = sum(1 for it in items
                         if topic_keys[it["msg_id"]]
                         and key_counts[topic_keys[it["msg_id"]]] >= 2)
 
     rows = []
     for it in items:
-        badges = ["🔴 未讀未回" if it["is_unread"] else "🟡 已讀未回"]
+        badges = ["🔴 未读未回" if it["is_unread"] else "🟡 已读未回"]
         if it["is_today"]:
-            badges.append("🔵 當日新進")
+            badges.append("🔵 当日新进")
         rows.append({
             "msg_id": it["msg_id"],
-            "優先級": " / ".join(badges),
+            "优先级": " / ".join(badges),
             "寄件者": it["from"],
-            "標題": grouped_titles[it["msg_id"]],
+            "标题": grouped_titles[it["msg_id"]],
             "收信日期": it["date"].strftime("%Y-%m-%d %H:%M"),
-            "等待時長": format_age(it["age_hours"]),
-            "郵件連結": f"https://mail.google.com/mail/u/0/#inbox/{it['msg_id']}",
+            "等待时长": format_age(it["age_hours"]),
+            "邮件连结": f"https://mail.google.com/mail/u/0/#inbox/{it['msg_id']}",
             "_body": it["body"],
             "_item": it,
         })
     df = pd.DataFrame(rows)
-    df["部門"] = df["寄件者"].apply(get_department)
-    df["客戶"] = df["寄件者"].apply(get_client)
+    df["部门"] = df["寄件者"].apply(get_department)
+    df["客户"] = df["寄件者"].apply(get_client)
 
     total = len(df)
-    unread_cnt = int(df["優先級"].str.contains("未讀未回", na=False).sum())
-    read_cnt = int(df["優先級"].str.contains("已讀未回", na=False).sum())
-    today_cnt = int(df["優先級"].str.contains("當日新進", na=False).sum())
+    unread_cnt = int(df["优先级"].str.contains("未读未回", na=False).sum())
+    read_cnt = int(df["优先级"].str.contains("已读未回", na=False).sum())
+    today_cnt = int(df["优先级"].str.contains("当日新进", na=False).sum())
 
     c1, c2, c3, c4 = st.columns(4)
-    c1.metric("📨 待處理總數", total)
-    c2.metric("🔴 未讀未回", unread_cnt)
-    c3.metric("🟡 已讀未回", read_cnt)
-    c4.metric("🔵 當日新進", today_cnt)
+    c1.metric("📨 待处理总数", total)
+    c2.metric("🔴 未读未回", unread_cnt)
+    c3.metric("🟡 已读未回", read_cnt)
+    c4.metric("🔵 当日新进", today_cnt)
 
     if unread_cnt > 0:
-        st.warning(f"⚠️ 有 **{unread_cnt}** 封還沒打開過,建議優先處理")
+        st.warning(f"⚠️ 有 **{unread_cnt}** 封还没打开过,建议优先处理")
 
-    st.markdown("##### 🏢 快速依客戶篩選")
-    client_counts = df["客戶"].value_counts().to_dict()
+    st.markdown("##### 🏢 快速依客户筛选")
+    client_counts = df["客户"].value_counts().to_dict()
     client_options = [f"全部 ({total})"] + [
         f"{c} ({n})" for c, n in sorted(client_counts.items(), key=lambda x: -x[1])
     ]
     selected_client_label = st.pills(
-        "客戶", client_options, default=client_options[0],
+        "客户", client_options, default=client_options[0],
         label_visibility="collapsed",
     )
     selected_client = None
@@ -1881,16 +1881,16 @@ def show_main_dashboard():
     fc1, fc2, fc3 = st.columns([1, 1, 2])
     with fc1:
         tag_count_map = {
-            "🔴 未讀未回": unread_cnt, "🟡 已讀未回": read_cnt, "🔵 當日新進": today_cnt,
+            "🔴 未读未回": unread_cnt, "🟡 已读未回": read_cnt, "🔵 当日新进": today_cnt,
         }
-        tag_opts = [f"{t} ({tag_count_map[t]})" for t in ["🔴 未讀未回", "🟡 已讀未回", "🔵 當日新進"]]
-        show_tags_l = st.multiselect("狀態(選填)", tag_opts, placeholder="不勾 = 全部")
+        tag_opts = [f"{t} ({tag_count_map[t]})" for t in ["🔴 未读未回", "🟡 已读未回", "🔵 当日新进"]]
+        show_tags_l = st.multiselect("状态(选填)", tag_opts, placeholder="不勾 = 全部")
     with fc2:
-        dept_count_map = df["部門"].value_counts().to_dict()
+        dept_count_map = df["部门"].value_counts().to_dict()
         dept_opts = [f"{d} ({dept_count_map.get(d, 0)})" for d in ALL_DEPARTMENTS]
-        show_depts_l = st.multiselect("部門(選填)", dept_opts, placeholder="不勾 = 全部")
+        show_depts_l = st.multiselect("部门(选填)", dept_opts, placeholder="不勾 = 全部")
     with fc3:
-        keyword = st.text_input("標題 / 寄件者搜尋(選填)")
+        keyword = st.text_input("标题 / 寄件者搜寻(选填)")
 
     show_tags = [t.rsplit(" (", 1)[0] for t in show_tags_l]
     show_depts = [d.rsplit(" (", 1)[0] for d in show_depts_l]
@@ -1898,15 +1898,15 @@ def show_main_dashboard():
     view_df = df.copy()
     if show_tags:
         pat = "|".join([t.split(" ")[1] for t in show_tags])
-        view_df = view_df[view_df["優先級"].str.contains(pat, na=False)]
+        view_df = view_df[view_df["优先级"].str.contains(pat, na=False)]
     if show_depts:
-        view_df = view_df[view_df["部門"].isin(show_depts)]
+        view_df = view_df[view_df["部门"].isin(show_depts)]
     if selected_client:
-        view_df = view_df[view_df["客戶"] == selected_client]
+        view_df = view_df[view_df["客户"] == selected_client]
     if keyword:
         kw = keyword.lower()
         view_df = view_df[
-            view_df["標題"].astype(str).str.lower().str.contains(kw, na=False)
+            view_df["标题"].astype(str).str.lower().str.contains(kw, na=False)
             | view_df["寄件者"].astype(str).str.lower().str.contains(kw, na=False)
         ]
     view_df = view_df.reset_index(drop=True)
@@ -1924,12 +1924,12 @@ def show_main_dashboard():
         prev = s
     view_df["寄件者"] = deduped
     deduped_depts = []
-    for i, d in enumerate(view_df["部門"]):
+    for i, d in enumerate(view_df["部门"]):
         deduped_depts.append("" if deduped[i] == "" else d)
-    view_df["部門"] = deduped_depts
+    view_df["部门"] = deduped_depts
 
-    st.subheader(f"📋 待處理清單  ({len(view_df)} 筆)")
-    st.caption("💡 同主題多封信會共用標題;單封信保留原主旨")
+    st.subheader(f"📋 待处理清单  ({len(view_df)} 笔)")
+    st.caption("💡 同主题多封信会共用标题;单封信保留原主旨")
 
     event = st.dataframe(
         view_df,
@@ -1937,18 +1937,18 @@ def show_main_dashboard():
         hide_index=True,
         on_select="rerun",
         selection_mode="single-row",
-        column_order=["寄件者", "部門", "優先級", "標題", "收信日期", "等待時長", "郵件連結"],
+        column_order=["寄件者", "部门", "优先级", "标题", "收信日期", "等待时长", "邮件连结"],
         column_config={
             "寄件者": st.column_config.TextColumn(width="medium"),
-            "部門": st.column_config.TextColumn(width="medium"),
-            "優先級": st.column_config.TextColumn(width="medium"),
-            "標題": st.column_config.TextColumn(width="large"),
+            "部门": st.column_config.TextColumn(width="medium"),
+            "优先级": st.column_config.TextColumn(width="medium"),
+            "标题": st.column_config.TextColumn(width="large"),
             "收信日期": st.column_config.TextColumn(width="small"),
-            "等待時長": st.column_config.TextColumn(width="small"),
-            "郵件連結": st.column_config.LinkColumn(
-                "📧 開啟", display_text="🔗 點此打開", width="small",
+            "等待时长": st.column_config.TextColumn(width="small"),
+            "邮件连结": st.column_config.LinkColumn(
+                "📧 开启", display_text="🔗 点此打开", width="small",
             ),
-            "msg_id": None, "客戶": None, "_body": None, "_item": None,
+            "msg_id": None, "客户": None, "_body": None, "_item": None,
         },
     )
 
@@ -1956,16 +1956,16 @@ def show_main_dashboard():
     if selected_rows:
         idx = selected_rows[0]
         item = view_df.iloc[idx]["_item"]
-        # 點開時要把該信的最終標題傳進去
+        # 点开时要把该信的最终标题传进去
         display_title_for_detail = grouped_titles[item["msg_id"]]
         render_email_detail(item, user_name, user_first_name, summary_cache, display_title_for_detail)
 
-    st.caption(f"頁面載入時間:{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    st.caption(f"页面载入时间:{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
 
 
 def main():
     handle_oauth_callback()
-    # 沒 user 時,先試從 URL 還原(支援瀏覽器重新整理免重新登入)
+    # 没 user 时,先试从 URL 还原(支援浏览器重新整理免重新登入)
     if "user" not in st.session_state:
         restore_session_from_url()
     if "user" not in st.session_state:
