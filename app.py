@@ -2741,19 +2741,10 @@ def show_main_dashboard():
         dept_opts = [f"{d} ({dept_count_map.get(d, 0)})" for d in ALL_DEPARTMENTS]
         show_depts_l = st.multiselect("部门(选填)", dept_opts, placeholder="不勾 = 全部")
     with fc4:
-        kw_col, btn_col = st.columns([4, 1])
-        with kw_col:
-            keyword = st.text_input(
-                "标题 / 寄件者搜寻(选填)",
-                key="_search_keyword",
-                placeholder="输入后按 Enter,清空请按右边 ✕",
-            )
-        with btn_col:
-            st.write("")
-            st.write("")
-            if st.button("✕", help="清除搜寻并显示全部", use_container_width=True):
-                st.session_state["_search_keyword"] = ""
-                st.rerun()
+        keyword = st.text_input(
+            "标题 / 寄件者搜寻(选填)",
+            placeholder="输入后按 Enter,清空再按 Enter 还原",
+        )
 
     show_sources = [s.rsplit(" (", 1)[0] for s in show_sources_l]
     show_tags = [t.rsplit(" (", 1)[0] for t in show_tags_l]
