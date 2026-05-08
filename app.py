@@ -1733,6 +1733,269 @@ def render_excel_update_panel(user, reminders=None):
                     st.rerun()
 
 
+def trace_filter_pipeline(creds_dict, current_user_email, search_days_override=None):
+    """逐层追踪过滤流程,记录每封信被哪个规则挡掉。
+
+    回传 dict:
+        - universe_threads: 全集 thread 数
+        - layers: list of {layer_name, before, after, dropped_examples}
+        - final_items: 最后通过的 thread 列表(给 dashboard 用的格式)
+        - all_dropped: 所有被挡的信件 + 原因
+    """
+    days = search_days_override or SEARCH_DAYS
+    creds = credentials_from_dict(creds_dict)
+    service = build("gmail", "v1", credentials=creds, cache_discovery=False)
+
+    all_dropped = []  # 每个被挡的 thread 都会记一笔
+
+    # ── 第 0 层:Gmail 业务关键字搜寻(已经在 query 端过滤) ──
+    # 这层是 Gmail server-side 过滤,我们抓不到「被这层挡掉」的信
+    # 但可以另外抓「不带 keyword 过滤」的所有 inbox thread,看差异
+    query_with_kw = (
+        f"in:inbox newer_than:{days}d "
+        f"({' OR '.join([f'subject:{k}' for k in BUSINESS_KEYWORDS])}) "
+        f"{' '.join([f'-from:{d}' for d in NOISE_DOMAINS])}"
+    )
+    query_no_kw = f"in:inbox newer_than:{days}d"
+
+    threads_full = service.users().threads().list(
+        userId="me", q=query_no_kw, maxResults=200
+    ).execute().get("threads", [])
+
+    threads_filtered = service.users().threads().list(
+        userId="me", q=query_with_kw, maxResults=200
+    ).execute().get("threads", [])
+
+    filtered_ids = {t["id"] for t in threads_filtered}
+
+    layer_keyword = {
+        "name": "1. 主旨业务关键字过滤",
+        "rule": f"主旨必须包含: {', '.join(BUSINESS_KEYWORDS)} 之一",
+        "before": len(threads_full),
+        "after": len(threads_filtered),
+        "dropped_examples": [],
+    }
+
+    # 抓「被关键字层挡掉」的 thread 实例(全集 - 通过) 取前 10 笔
+    dropped_by_kw_ids = [t["id"] for t in threads_full if t["id"] not in filtered_ids][:10]
+    for tid in dropped_by_kw_ids:
+        try:
+            tdata = service.users().threads().get(
+                userId="me", id=tid, format="metadata",
+                metadataHeaders=["Subject", "From"],
+            ).execute()
+            msgs = tdata.get("messages", [])
+            if msgs:
+                last = msgs[-1]
+                hd = {h["name"]: h["value"] for h in last.get("payload", {}).get("headers", [])}
+                example = {
+                    "subject": hd.get("Subject", ""),
+                    "from": hd.get("From", ""),
+                    "thread_id": tid,
+                    "reason": "主旨没有任何业务关键字",
+                }
+                layer_keyword["dropped_examples"].append(example)
+                all_dropped.append(example)
+        except Exception:
+            pass
+
+    # ── 第 2 层 ~ 第 5 层:在通过 keyword 的 thread 内逐一检查 ──
+    layer_external = {
+        "name": "2. 必须有外部寄件者",
+        "rule": "thread 中至少要有 1 封信不是 @ibiney.io 寄出",
+        "before": len(threads_filtered),
+        "after": 0, "dropped_examples": [],
+    }
+    layer_noise = {
+        "name": "3. 排除噪音域名",
+        "rule": f"最后一封外部信不能来自: {', '.join(NOISE_DOMAINS)}",
+        "before": 0, "after": 0, "dropped_examples": [],
+    }
+    layer_user_replied = {
+        "name": "4. B 逻辑:你还没回过",
+        "rule": f"最后一封外部信之后, {current_user_email} 不能已回过",
+        "before": 0, "after": 0, "dropped_examples": [],
+    }
+
+    final_items = []
+
+    for t in threads_filtered:
+        try:
+            full = service.users().threads().get(
+                userId="me", id=t["id"], format="full",
+            ).execute()
+            messages = full.get("messages", [])
+            if not messages:
+                continue
+
+            last_subject = ""
+            last_from_overall = ""
+            if messages:
+                hd = {h["name"]: h["value"] for h in messages[-1].get("payload", {}).get("headers", [])}
+                last_subject = hd.get("Subject", "")
+                last_from_overall = hd.get("From", "")
+
+            # Layer 2: 必须有外部寄件者
+            last_ext_idx = -1
+            for i in range(len(messages) - 1, -1, -1):
+                hd2 = {h["name"]: h["value"] for h in messages[i].get("payload", {}).get("headers", [])}
+                em = extract_email(hd2.get("From", ""))
+                if em and not is_internal(em):
+                    last_ext_idx = i
+                    break
+            if last_ext_idx == -1:
+                ex = {
+                    "subject": last_subject, "from": last_from_overall,
+                    "thread_id": t["id"], "reason": "整 thread 都是内部信件",
+                }
+                layer_external["dropped_examples"].append(ex)
+                all_dropped.append(ex)
+                continue
+            layer_external["after"] += 1
+            layer_noise["before"] += 1
+
+            # Layer 3: 噪音域名
+            last_ext_hd = {h["name"]: h["value"] for h in messages[last_ext_idx].get("payload", {}).get("headers", [])}
+            last_ext_from = last_ext_hd.get("From", "")
+            last_ext_email = extract_email(last_ext_from)
+            if is_noise_domain(last_ext_email):
+                ex = {
+                    "subject": last_subject, "from": last_ext_from,
+                    "thread_id": t["id"], "reason": f"寄件域名是噪音 ({last_ext_email})",
+                }
+                layer_noise["dropped_examples"].append(ex)
+                all_dropped.append(ex)
+                continue
+            layer_noise["after"] += 1
+            layer_user_replied["before"] += 1
+
+            # Layer 4: B 逻辑 - 当前 user 是否已回过
+            user_replied = False
+            for j in range(last_ext_idx + 1, len(messages)):
+                hd3 = {h["name"]: h["value"] for h in messages[j].get("payload", {}).get("headers", [])}
+                em = extract_email(hd3.get("From", ""))
+                if em == current_user_email.lower():
+                    user_replied = True
+                    break
+            if user_replied:
+                ex = {
+                    "subject": last_subject, "from": last_ext_from,
+                    "thread_id": t["id"],
+                    "reason": f"{current_user_email} 在最后一封外部信之后已回过",
+                }
+                layer_user_replied["dropped_examples"].append(ex)
+                all_dropped.append(ex)
+                continue
+            layer_user_replied["after"] += 1
+
+            # 通过所有层 → final
+            final_items.append({
+                "subject": last_subject, "from": last_ext_from,
+                "thread_id": t["id"], "msg_count": len(messages),
+            })
+        except Exception as e:
+            ex = {
+                "subject": "(error)", "from": "",
+                "thread_id": t["id"], "reason": f"处理异常: {e}",
+            }
+            all_dropped.append(ex)
+
+    return {
+        "search_days": days,
+        "current_user": current_user_email,
+        "layers": [layer_keyword, layer_external, layer_noise, layer_user_replied],
+        "final_count": len(final_items),
+        "final_items": final_items,
+        "all_dropped": all_dropped,
+    }
+
+
+def render_filter_trace(user):
+    """显示「过滤追踪」面板:逐层显示每层挡掉多少信件,例子。"""
+    st.markdown("### 🕵️ 过滤追踪面板")
+    st.caption(
+        "逐层显示过滤流程。每层挡掉的信件可以展开看具体例子,"
+        "判断「这封该擋还是该放过」。"
+    )
+
+    # 让用户决定 search range:有时候问题在 3 天太短
+    days = st.slider(
+        "搜寻范围(天)", min_value=1, max_value=14, value=SEARCH_DAYS,
+        help="目前 dashboard 设定 3 天。可以拉长来看更早的信是否被遗漏",
+    )
+
+    if st.button("🔍 开始追踪"):
+        with st.spinner(f"扫描过去 {days} 天 inbox 中..."):
+            try:
+                trace = trace_filter_pipeline(user["creds"], user["email"], days)
+                st.session_state["_filter_trace_result"] = trace
+            except Exception as e:
+                st.error(f"追踪失败: {e}")
+                return
+
+    if "_filter_trace_result" not in st.session_state:
+        return
+
+    trace = st.session_state["_filter_trace_result"]
+
+    # ── 总览 ──
+    st.markdown("#### 📊 过滤漏斗")
+    layers = trace["layers"]
+    funnel_rows = []
+    for i, layer in enumerate(layers):
+        funnel_rows.append({
+            "层级": layer["name"],
+            "进入数": layer["before"],
+            "通过数": layer["after"],
+            "被挡": layer["before"] - layer["after"],
+            "通过率": f"{round(100 * layer['after'] / max(layer['before'], 1), 1)}%",
+        })
+    funnel_rows.append({
+        "层级": "✅ Dashboard 最终显示",
+        "进入数": layers[-1]["after"],
+        "通过数": trace["final_count"],
+        "被挡": 0,
+        "通过率": "100%",
+    })
+    st.dataframe(pd.DataFrame(funnel_rows), use_container_width=True, hide_index=True)
+
+    st.divider()
+
+    # ── 每层挡掉的实例 ──
+    st.markdown("#### 🔬 每层挡掉的具体例子(展开看)")
+    for layer in layers:
+        dropped_count = layer["before"] - layer["after"]
+        with st.expander(f"{layer['name']} — 挡掉 {dropped_count} 笔"):
+            st.caption(f"**规则**:{layer['rule']}")
+            if not layer["dropped_examples"]:
+                st.info("没有被这层挡掉的信件")
+                continue
+            for ex in layer["dropped_examples"]:
+                st.markdown(f"""
+- **{ex.get('subject', '')[:80]}**
+  - From: `{ex.get('from', '')}`
+  - 原因: {ex.get('reason', '')}
+  - Thread: `{ex.get('thread_id', '')}`
+""")
+
+    st.divider()
+
+    # ── 通过的最终列表 ──
+    st.markdown(f"#### ✅ 最终通过 dashboard 显示的 {trace['final_count']} 笔")
+    if trace["final_items"]:
+        df = pd.DataFrame(trace["final_items"])
+        st.dataframe(df, use_container_width=True, hide_index=True)
+
+    # ── 下载完整 dump ──
+    import json as _json
+    st.download_button(
+        "⬇️ 下載完整追踪 dump (JSON)",
+        data=_json.dumps(trace, default=str, indent=2, ensure_ascii=False),
+        file_name=f"btl_filter_trace_{user.get('email', '').split('@')[0]}.json",
+        mime="application/json",
+    )
+
+
 def render_read_unread_debug(user):
     """Debug 面板:列出每封信的 Gmail labels + 系统判断结果。
 
@@ -1839,6 +2102,9 @@ def show_main_dashboard():
 
     # 开发/PRD 用工具(收在 expander 里,不影响日常使用)
     with st.sidebar.expander("🧪 开发工具"):
+        if st.button("🕵️ 过滤追踪(看哪些信被挡掉)"):
+            st.session_state["_filter_trace"] = True
+            st.session_state.pop("_filter_trace_result", None)
         if st.button("🔍 已读/未读 偵錯"):
             st.session_state["_read_unread_debug"] = True
         if st.button("📋 Quality Report(系统验证)"):
@@ -1849,6 +2115,14 @@ def show_main_dashboard():
         if st.button("📊 附件分析(PRD 用)"):
             st.session_state["_attachment_analysis"] = True
             st.session_state.pop("_attachment_stats", None)  # 重新分析
+
+    if st.session_state.get("_filter_trace"):
+        render_filter_trace(user)
+        if st.button("关闭过滤追踪"):
+            st.session_state.pop("_filter_trace", None)
+            st.session_state.pop("_filter_trace_result", None)
+            st.rerun()
+        st.divider()
 
     if st.session_state.get("_read_unread_debug"):
         render_read_unread_debug(user)
