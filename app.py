@@ -2399,6 +2399,198 @@ def render_filter_trace(user):
     )
 
 
+def render_thread_inspector(user):
+    """单 thread 偵錯工具:输入关键字,找到匹配的 thread,逐封显示处理细节。
+
+    用来诊断「这封信为什么没出现在 dashboard」这种问题。
+    """
+    st.markdown("### 🔬 单 Thread 偵錯")
+    st.caption(
+        "输入任一关键字(主旨内容、款号、寄件者),系统找到所有 Gmail 中匹配的 thread,"
+        "**逐封信**显示处理细节(日期、寄件者、是否内部、是否被当代表)。"
+    )
+
+    keyword = st.text_input("搜寻关键字(例如 06362)", key="_thread_inspect_kw")
+    days_lookback = st.slider("Gmail 搜寻范围(天)", 1, 14, 7, key="_thread_inspect_days")
+
+    if not st.button("🔍 开始诊断"):
+        return
+
+    if not keyword.strip():
+        st.warning("请输入关键字")
+        return
+
+    with st.spinner("查询 Gmail..."):
+        creds = credentials_from_dict(user["creds"])
+        service = build("gmail", "v1", credentials=creds, cache_discovery=False)
+        # 直接搜:不限关键字过滤,只看用户输入
+        query = f"in:inbox newer_than:{days_lookback}d \"{keyword}\""
+        try:
+            resp = service.users().threads().list(
+                userId="me", q=query, maxResults=20
+            ).execute()
+        except Exception as e:
+            st.error(f"Gmail 搜寻失败:{e}")
+            return
+        threads = resp.get("threads", [])
+
+    if not threads:
+        st.warning(f"Gmail 找不到包含「{keyword}」的 thread(过去 {days_lookback} 天)")
+        return
+
+    st.success(f"找到 {len(threads)} 个 thread")
+
+    now = datetime.now(timezone.utc)
+    cutoff = now - timedelta(days=SEARCH_DAYS)
+
+    for t_idx, t in enumerate(threads, start=1):
+        try:
+            full = service.users().threads().get(
+                userId="me", id=t["id"], format="full"
+            ).execute()
+        except Exception as e:
+            st.error(f"获取 thread {t['id']} 失败:{e}")
+            continue
+
+        messages_meta = full.get("messages", [])
+        if not messages_meta:
+            continue
+
+        # 提取头资讯
+        first_subject = ""
+        if messages_meta:
+            hd = {h["name"]: h["value"] for h in messages_meta[0].get("payload", {}).get("headers", [])}
+            first_subject = hd.get("Subject", "(no subject)")
+
+        st.markdown("---")
+        st.markdown(f"### 📂 Thread {t_idx}: {first_subject}")
+        st.caption(f"Thread ID: `{t['id']}` · 信件数: {len(messages_meta)}")
+
+        # 来源判断
+        source_label, _, _ = determine_source(messages_meta, "")
+        st.markdown(f"**来源**: {source_label}")
+
+        # 逐封显示
+        rows = []
+        for i, m in enumerate(messages_meta):
+            hd = {h["name"]: h["value"] for h in m.get("payload", {}).get("headers", [])}
+            from_h = hd.get("From", "")
+            subject_h = hd.get("Subject", "")
+            date_h = hd.get("Date", "")
+            try:
+                mdate = parsedate_to_datetime(date_h)
+                if mdate.tzinfo is None:
+                    mdate = mdate.replace(tzinfo=timezone.utc)
+            except Exception:
+                mdate = None
+
+            em = extract_email(from_h)
+            in_window = mdate and mdate >= cutoff
+            internal = em and is_internal(em)
+            is_key = em in KEY_REPLIERS
+
+            # 检查签名
+            sig_says = None
+            if internal:
+                body = extract_plain_body(m.get("payload", {}))
+                sig_says = signature_says_key_replier(body)
+
+            rows.append({
+                "#": i + 1,
+                "日期": mdate.strftime("%Y-%m-%d %H:%M") if mdate else "(无)",
+                "在窗口内": "✅" if in_window else "❌ 出窗口",
+                "From": from_h[:50],
+                "Email": em,
+                "类型": "内部" if internal else "外部",
+                "From=Key": "✅" if is_key else "",
+                "签名说": sig_says or "",
+                "主旨": subject_h[:50],
+            })
+
+        df = pd.DataFrame(rows)
+        st.dataframe(df, use_container_width=True, hide_index=True)
+
+        # 模拟 fetch_pending_emails 的判断
+        st.markdown("**🧮 系统判断模拟**:")
+
+        # 1. last_external_date
+        last_external_date = None
+        for m in messages_meta:
+            hd = {h["name"]: h["value"] for h in m.get("payload", {}).get("headers", [])}
+            em = extract_email(hd.get("From", ""))
+            if em and not is_internal(em):
+                d = _parse_date_safe(hd.get("Date", ""))
+                if d and (last_external_date is None or d > last_external_date):
+                    last_external_date = d
+
+        # 2. KEY_REPLIERS 处理时间
+        key_handled_after = False
+        key_handle_msg = None
+        for m in messages_meta:
+            hd = {h["name"]: h["value"] for h in m.get("payload", {}).get("headers", [])}
+            em = extract_email(hd.get("From", ""))
+            d = _parse_date_safe(hd.get("Date", ""))
+            is_handled = em in KEY_REPLIERS
+            if not is_handled and em and is_internal(em):
+                if signature_says_key_replier(extract_plain_body(m.get("payload", {}))):
+                    is_handled = True
+            if is_handled and d:
+                if last_external_date is None:
+                    key_handled_after = True
+                    key_handle_msg = m
+                    break
+                elif d > last_external_date:
+                    key_handled_after = True
+                    key_handle_msg = m
+                    break
+
+        # 3. 代表信
+        last_target = -1
+        for i in range(len(messages_meta) - 1, -1, -1):
+            d = _parse_date_safe(
+                next((h["value"] for h in messages_meta[i].get("payload", {}).get("headers", []) if h["name"] == "Date"), "")
+            )
+            if not d or d < cutoff:
+                continue
+            if source_label == "🌍 外部":
+                em = extract_email(
+                    next((h["value"] for h in messages_meta[i].get("payload", {}).get("headers", []) if h["name"] == "From"), "")
+                )
+                if em and not is_internal(em):
+                    last_target = i
+                    break
+            else:
+                last_target = i
+                break
+
+        # 4. 结论
+        if last_target < 0:
+            verdict = "❌ **被过滤** — 窗口内没有合适的代表信"
+        elif key_handled_after:
+            verdict = "❌ **被过滤** — David/Ivy 已在最后一封外部信之后处理"
+        else:
+            verdict = f"✅ **应该显示** — 代表信是第 {last_target + 1} 封"
+
+        st.info(verdict)
+        if last_external_date:
+            st.caption(f"最后一封外部信日期: {last_external_date.strftime('%Y-%m-%d %H:%M')}")
+        if key_handle_msg:
+            kh_hd = {h["name"]: h["value"] for h in key_handle_msg.get("payload", {}).get("headers", [])}
+            st.caption(f"David/Ivy 处理时间: {kh_hd.get('Date', '?')}")
+
+
+def _parse_date_safe(date_str):
+    if not date_str:
+        return None
+    try:
+        d = parsedate_to_datetime(date_str)
+        if d.tzinfo is None:
+            d = d.replace(tzinfo=timezone.utc)
+        return d
+    except Exception:
+        return None
+
+
 def render_read_unread_debug(user):
     """Debug 面板:列出每封信的 Gmail labels + 系统判断结果。
 
@@ -2527,6 +2719,7 @@ def show_main_dashboard():
     dev_panel_keys = [
         "_source_demo", "_filter_trace", "_read_unread_debug",
         "_quality_check", "_phase6_probe", "_attachment_analysis",
+        "_thread_inspector",
     ]
 
     def _toggle_dev_panel(panel_key, also_pop=None):
@@ -2559,6 +2752,9 @@ def show_main_dashboard():
                 st.rerun()
             st.divider()
 
+        if st.button("🔬 单 thread 偵錯(找漏掉的信)", use_container_width=True):
+            _toggle_dev_panel("_thread_inspector")
+            st.rerun()
         if st.button("🎨 「来源」栏 demo 预览", use_container_width=True):
             _toggle_dev_panel("_source_demo")
             st.rerun()
@@ -2577,6 +2773,10 @@ def show_main_dashboard():
         if st.button("📊 附件分析(PRD 用)", use_container_width=True):
             _toggle_dev_panel("_attachment_analysis", also_pop=["_attachment_stats"])
             st.rerun()
+
+    if st.session_state.get("_thread_inspector"):
+        render_thread_inspector(user)
+        st.divider()
 
     if st.session_state.get("_source_demo"):
         render_source_demo()
