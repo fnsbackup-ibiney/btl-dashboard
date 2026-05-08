@@ -39,6 +39,10 @@ BUSINESS_KEYWORDS = [
     # 扩充:款号 / 季节码 / 客户代号
     "YAN", "BIN", "SAB", "FS", "BX", "Hangloop", "S27", "W26", "S26", "W27",
 ]
+
+# 关键回信人:**只有这些人**回客户,thread 才算「已处理」
+# 其他同事(BTL FNS R / BTL FNS SKY 等)回的不算
+KEY_REPLIERS = ["david@ibiney.io", "ivy@ibiney.io"]
 NOISE_DOMAINS = ["blot.new", "cloudhq.net", "bolt.eu"]
 INTERNAL_DOMAIN = "ibiney.io"
 SEARCH_DAYS = 3
@@ -494,24 +498,39 @@ def fetch_pending_emails(creds_dict, current_user_email, search_days=None):
             # thread 在 SEARCH_DAYS 内没有合适的代表信,整 thread 跳过
             continue
 
-        # B 逻辑:看「在 last_target 之后,当前 user 是否已回过」
-        # 转寄 / 内部 thread:看 last_target 是不是 当前 user 自己 → 是的话 = 已回
-        # 外部 thread:看 last_target 之后有没有 user 回过
-        user_replied = False
-        if source_label == "🌍 外部":
-            for j in range(last_target_idx + 1, len(messages_meta)):
-                hd = {h["name"]: h["value"] for h in messages_meta[j].get("payload", {}).get("headers", [])}
-                em = extract_email(hd.get("From", ""))
-                if em == current_user_email.lower():
-                    user_replied = True
+        # B 逻辑:**只有 David 或 Ivy** 回了之后才算「已处理」
+        # 其他同事(BTL FNS R / SKY 等)回的不算
+        # 规则:看 thread 中有没有「KEY_REPLIERS 里的人」发过信
+        # 而且这封信日期晚于「最后一封来自外部客户的信」
+        # (转寄/内部 thread 没真实外部信 → 直接看 thread 里有没有 David/Ivy 发过信)
+        replied_by_key_person = False
+
+        # 找最后一封外部信的时间(如果有)
+        last_external_date = None
+        for m in messages_meta:
+            hd = {h["name"]: h["value"] for h in m.get("payload", {}).get("headers", [])}
+            em = extract_email(hd.get("From", ""))
+            if em and not is_internal(em):
+                d = _msg_date(m)
+                if d and (last_external_date is None or d > last_external_date):
+                    last_external_date = d
+
+        # 扫整个 thread,看有没有 KEY_REPLIERS 在那之后(或之内)发过信
+        for m in messages_meta:
+            hd = {h["name"]: h["value"] for h in m.get("payload", {}).get("headers", [])}
+            em = extract_email(hd.get("From", ""))
+            if em in KEY_REPLIERS:
+                d = _msg_date(m)
+                if last_external_date is None:
+                    # 没真实外部信(转寄/内部 thread)→ 只要 David/Ivy 在 thread 里发过信就算处理
+                    replied_by_key_person = True
                     break
-        else:
-            # 转寄 / 内部:看最后一封是不是 current user 寄的
-            hd_last = {h["name"]: h["value"] for h in messages_meta[last_target_idx].get("payload", {}).get("headers", [])}
-            last_em = extract_email(hd_last.get("From", ""))
-            if last_em == current_user_email.lower():
-                user_replied = True
-        if user_replied:
+                elif d and d > last_external_date:
+                    # 有外部信 → David/Ivy 发信日期必须晚于最后一封外部信
+                    replied_by_key_person = True
+                    break
+
+        if replied_by_key_person:
             continue
 
         last_msg = parse_gmail_message(service, messages_meta[last_target_idx]["id"])
