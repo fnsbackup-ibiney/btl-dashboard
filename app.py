@@ -504,16 +504,10 @@ def fetch_pending_emails(creds_dict, current_user_email):
             if is_noise_domain(extract_email(last_msg["from"])):
                 continue
 
-        # 决定显示用的「寄件者」:
-        # 外部 → 真实寄件者
-        # 转寄 → 抽出来的原始客户(real_external_from)
-        # 内部 → 真实寄件者
-        if source_label == "📨 转寄" and real_external_from:
-            display_from = f"{real_external_from} (原)"
-            display_email = real_external_email
-        else:
-            display_from = last_msg["from"]
-            display_email = extract_email(last_msg["from"])
+        # Demo 1 简单版:寄件者一律显示 Gmail 表面寄件者(不抽原客户)
+        # 来源资讯靠左侧「来源」栏 emoji 区分:🌍 外部 / 📨 转寄 / 🏢 内部
+        display_from = last_msg["from"]
+        display_email = extract_email(last_msg["from"])
 
         is_today = last_msg["date"] >= today_start
         age_hours = int((now - last_msg["date"]).total_seconds() // 3600)
