@@ -295,6 +295,84 @@ def extract_plain_body(payload):
     return ""
 
 
+def signature_says_key_replier(body):
+    """检查信件「电子签名区」是否署名 David 或 Ivy。
+
+    只看 BR / Best regards / Sincerely / Regards / Cheers / 此致 等
+    标准签名词之后的内容,不扫整封信(避免误抓 'Hi David' 这种)。
+
+    回传 'david' / 'ivy' / None
+    """
+    if not body:
+        return None
+
+    # 切到「转寄区块之前」(避免抓到原信件签名)
+    forward_markers = [
+        r"-{3,}\s*Forwarded message",
+        r"-{3,}\s*Original Message",
+        r"-{3,}\s*转发邮件",
+        r"-{3,}\s*原始邮件",
+        r"Begin forwarded message",
+        r"Weitergeleitete Nachricht",
+        r"On .{1,80}wrote:",   # Gmail 引言区前的「On Mon, ... wrote:」
+    ]
+    end_idx = len(body)
+    for marker in forward_markers:
+        m = re.search(marker, body, re.IGNORECASE)
+        if m and m.start() < end_idx:
+            end_idx = m.start()
+    text = body[:end_idx]
+
+    # 找电子签名词:BR / Best / Sincerely / Regards / Cheers / Thanks / 此致 / 敬上
+    sig_markers = [
+        r"\n\s*BR\s*[,，。:]?\s*\n",
+        r"\n\s*Best\s+regards\b",
+        r"\n\s*Best\s+rgds\b",
+        r"\n\s*Best\b",
+        r"\n\s*Sincerely\b",
+        r"\n\s*Regards\b",
+        r"\n\s*Cheers\b",
+        r"\n\s*Thanks\s*[,，]?\s*\n",
+        r"\n\s*Many\s+thanks\b",
+        r"\n\s*此致\s*\n",
+        r"\n\s*敬上\s*\n",
+        r"\n\s*顺祝商祺\b",
+    ]
+    sig_start = None
+    for marker in sig_markers:
+        m = re.search(marker, text, re.IGNORECASE)
+        if m and (sig_start is None or m.end() < sig_start):
+            sig_start = m.end()
+    if sig_start is None:
+        return None
+
+    # 取签名词之后到结束的「最多 250 字」当签名区
+    sig_block = text[sig_start: sig_start + 250].lower()
+
+    # 在签名区内找 david / ivy(独立词或常见组合)
+    # 不要误抓「David Bowie」之类的非员工
+    david_patterns = [
+        r"\bdavid\b",
+        r"david[/／、,，\s]+\w+",   # David/Leona, David, Jenny
+        r"\w+[/／、,，\s]+david\b",  # Leona/David
+        r"btl\s*david",
+    ]
+    ivy_patterns = [
+        r"\bivy\b",
+        r"ivy[/／、,，\s]+\w+",
+        r"\w+[/／、,，\s]+ivy\b",
+        r"btl\s*ivy",
+    ]
+
+    for pat in david_patterns:
+        if re.search(pat, sig_block):
+            return "david"
+    for pat in ivy_patterns:
+        if re.search(pat, sig_block):
+            return "ivy"
+    return None
+
+
 def extract_forwarded_sender(body):
     """从转寄信件的内文里抽出原始客户的 email + 名称。
 
@@ -500,9 +578,11 @@ def fetch_pending_emails(creds_dict, current_user_email, search_days=None):
 
         # B 逻辑:**只有 David 或 Ivy** 回了之后才算「已处理」
         # 其他同事(BTL FNS R / SKY 等)回的不算
-        # 规则:看 thread 中有没有「KEY_REPLIERS 里的人」发过信
-        # 而且这封信日期晚于「最后一封来自外部客户的信」
-        # (转寄/内部 thread 没真实外部信 → 直接看 thread 里有没有 David/Ivy 发过信)
+        # 「David/Ivy 回过」两种判断方式:
+        #   (a) From: david@ibiney.io 或 ivy@ibiney.io
+        #   (b) 信件电子签名区署名 David / Ivy(忽略大小写)
+        # 而且这封信日期必须晚于「最后一封来自外部客户的信」
+        # (转寄/内部 thread 没真实外部信 → 直接看 thread 里有没有 David/Ivy 处理过)
         replied_by_key_person = False
 
         # 找最后一封外部信的时间(如果有)
@@ -515,20 +595,34 @@ def fetch_pending_emails(creds_dict, current_user_email, search_days=None):
                 if d and (last_external_date is None or d > last_external_date):
                     last_external_date = d
 
-        # 扫整个 thread,看有没有 KEY_REPLIERS 在那之后(或之内)发过信
+        # 扫整个 thread,看有没有 KEY_REPLIERS / 签名 David|Ivy 在那之后(或之内)
         for m in messages_meta:
             hd = {h["name"]: h["value"] for h in m.get("payload", {}).get("headers", [])}
             em = extract_email(hd.get("From", ""))
+            d = _msg_date(m)
+
+            # 判断这封信是否来自 David/Ivy(从 From 或签名)
+            is_key_msg = False
             if em in KEY_REPLIERS:
-                d = _msg_date(m)
-                if last_external_date is None:
-                    # 没真实外部信(转寄/内部 thread)→ 只要 David/Ivy 在 thread 里发过信就算处理
-                    replied_by_key_person = True
-                    break
-                elif d and d > last_external_date:
-                    # 有外部信 → David/Ivy 发信日期必须晚于最后一封外部信
-                    replied_by_key_person = True
-                    break
+                is_key_msg = True
+            else:
+                # 检查电子签名(只对 ibiney.io 内部信查,外部信不查避免误抓)
+                if em and is_internal(em):
+                    body_for_sig = extract_plain_body(m.get("payload", {}))
+                    if signature_says_key_replier(body_for_sig):
+                        is_key_msg = True
+
+            if not is_key_msg:
+                continue
+
+            if last_external_date is None:
+                # 没真实外部信(转寄/内部 thread)→ 只要 David/Ivy 在 thread 里处理过就算
+                replied_by_key_person = True
+                break
+            elif d and d > last_external_date:
+                # 有外部信 → David/Ivy 处理日期必须晚于最后一封外部信
+                replied_by_key_person = True
+                break
 
         if replied_by_key_person:
             continue
