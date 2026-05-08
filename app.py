@@ -2449,6 +2449,305 @@ def render_filter_trace(user):
     )
 
 
+# ═══════════════════════════════════════════════════════════════
+# 1 个月数据分析(PRD 用 — David 建议)
+# ═══════════════════════════════════════════════════════════════
+
+def download_month_data(user, days=30):
+    """从当前登入帐号抓过去 N 天 inbox 所有 thread,完整 dump。
+
+    回传 list of dict,每筆代表一个 thread:
+        {thread_id, subject, msg_count, messages: [{from, date, subject, has_attachment}]}
+    """
+    creds = credentials_from_dict(user["creds"])
+    service = build("gmail", "v1", credentials=creds, cache_discovery=False)
+    query = f"in:inbox newer_than:{days}d"
+    threads_resp = service.users().threads().list(
+        userId="me", q=query, maxResults=500
+    ).execute()
+    threads = threads_resp.get("threads", [])
+
+    # 翻页(Gmail 单次最多 500)
+    next_token = threads_resp.get("nextPageToken")
+    while next_token and len(threads) < 2000:
+        more = service.users().threads().list(
+            userId="me", q=query, maxResults=500, pageToken=next_token,
+        ).execute()
+        threads.extend(more.get("threads", []))
+        next_token = more.get("nextPageToken")
+
+    out = []
+    for t in threads:
+        try:
+            full = service.users().threads().get(
+                userId="me", id=t["id"], format="metadata",
+                metadataHeaders=["From", "To", "Cc", "Subject", "Date"],
+            ).execute()
+        except Exception:
+            continue
+        messages = full.get("messages", [])
+        if not messages:
+            continue
+
+        # 抽 thread 等级资讯
+        first_hd = {h["name"]: h["value"] for h in messages[0].get("payload", {}).get("headers", [])}
+        thread_subject = first_hd.get("Subject", "")
+
+        # 每封信
+        msgs = []
+        for m in messages:
+            hd = {h["name"]: h["value"] for h in m.get("payload", {}).get("headers", [])}
+
+            # 检查附件(看 payload.parts 是否有 filename)
+            has_attachment = False
+            attachment_types = []
+            def walk_for_attachments(payload):
+                nonlocal has_attachment
+                if not payload:
+                    return
+                fn = payload.get("filename", "")
+                if fn:
+                    has_attachment = True
+                    ext = fn.rsplit(".", 1)[-1].lower() if "." in fn else "(no_ext)"
+                    attachment_types.append(ext)
+                for sub in payload.get("parts", []) or []:
+                    walk_for_attachments(sub)
+            walk_for_attachments(m.get("payload", {}))
+
+            msgs.append({
+                "from": hd.get("From", ""),
+                "to": hd.get("To", ""),
+                "cc": hd.get("Cc", ""),
+                "subject": hd.get("Subject", ""),
+                "date": hd.get("Date", ""),
+                "label_ids": m.get("labelIds", []),
+                "has_attachment": has_attachment,
+                "attachment_types": attachment_types,
+            })
+
+        out.append({
+            "thread_id": t["id"],
+            "subject": thread_subject,
+            "msg_count": len(messages),
+            "messages": msgs,
+        })
+
+    return out
+
+
+def render_month_download(user):
+    """UI: 触发下载 + 存成 JSON。"""
+    st.markdown("### 📥 下载 1 个月 fnsbackup 数据")
+    st.caption(
+        "从目前登入的帐号抓过去 30 天 inbox 完整数据(每个 thread + 每封信的 metadata)。"
+        "用来分析业务 pattern、写 PRD、验证 Monitor 准确率。"
+    )
+
+    days = st.slider("范围(天)", min_value=7, max_value=60, value=30, key="_dl_days")
+
+    if st.button("📥 开始下载"):
+        with st.spinner(f"从 Gmail 抓取过去 {days} 天数据(可能 1-5 分钟)..."):
+            try:
+                data = download_month_data(user, days=days)
+            except Exception as e:
+                st.error(f"下载失败:{e}")
+                return
+            st.session_state["_month_data"] = data
+            st.session_state["_month_data_days"] = days
+
+    if "_month_data" not in st.session_state:
+        return
+
+    data = st.session_state["_month_data"]
+    actual_days = st.session_state.get("_month_data_days", days)
+    total_msgs = sum(t["msg_count"] for t in data)
+    st.success(f"✅ 已抓 {len(data)} 个 thread / 共 {total_msgs} 封信(过去 {actual_days} 天)")
+
+    # 提供 JSON 下载
+    import json as _json
+    json_str = _json.dumps(data, ensure_ascii=False, indent=2, default=str)
+    st.download_button(
+        "💾 下载 JSON 到电脑",
+        data=json_str,
+        file_name=f"fnsbackup_{actual_days}days_{datetime.now().strftime('%Y%m%d')}.json",
+        mime="application/json",
+    )
+    st.caption(f"档案大小约 {len(json_str) // 1024} KB")
+    st.info("提示:数据已暂存到 session,可直接点开「📊 1 个月 Pattern 分析」面板看报告(不用先下载 JSON)")
+
+
+def render_month_analysis(user):
+    """读取 session 里的 month data,产 pattern 报告。"""
+    st.markdown("### 📊 1 个月 Pattern 分析报告")
+    st.caption("基于「📥 下载 1 个月 fnsbackup 数据」面板抓的资料。先点那个面板的「开始下载」再来看这里。")
+
+    if "_month_data" not in st.session_state:
+        st.warning("还没有数据。请先打开「📥 下载 1 个月 fnsbackup 数据」面板,按「开始下载」。")
+        return
+
+    data = st.session_state["_month_data"]
+    actual_days = st.session_state.get("_month_data_days", 30)
+
+    # 总览
+    total_threads = len(data)
+    total_msgs = sum(t["msg_count"] for t in data)
+    st.markdown(f"#### 📈 总览(过去 {actual_days} 天)")
+    c1, c2, c3 = st.columns(3)
+    c1.metric("Thread 数", total_threads)
+    c2.metric("总信件数", total_msgs)
+    c3.metric("平均每 thread 信件数", f"{total_msgs / max(total_threads, 1):.1f}")
+
+    # 客户分布
+    st.markdown("#### 🏢 客户分布(从外部寄件者域名)")
+    client_counter = Counter()
+    for t in data:
+        for m in t["messages"]:
+            em = extract_email(m["from"])
+            if em and not is_internal(em) and "@" in em:
+                domain = em.split("@")[1]
+                base = domain.split(".")[0].split("-")[0].lower()
+                display = CLIENT_DISPLAY_MAP.get(base, base.capitalize())
+                client_counter[display] += 1
+    if client_counter:
+        client_df = pd.DataFrame(client_counter.most_common(15), columns=["客户", "信件数"])
+        client_df["佔比"] = client_df["信件数"].apply(lambda n: f"{100*n/sum(client_counter.values()):.1f}%")
+        st.dataframe(client_df, use_container_width=True, hide_index=True)
+
+    # 业务话题词频
+    st.markdown("#### 💬 业务话题词频(主旨)")
+    topic_words = [
+        "approval", "comment", "comments", "delivery", "shipping", "PI", "PO",
+        "Order", "Sample", "Color", "Material", "Quality", "Production", "Price",
+        "Spec", "Print", "Tape", "Zipper", "Hangloop", "Label", "Trim", "Trims",
+    ]
+    topic_counter = Counter()
+    for t in data:
+        subject = t["subject"].lower()
+        for w in topic_words:
+            if w.lower() in subject:
+                topic_counter[w] += 1
+    if topic_counter:
+        topic_df = pd.DataFrame(topic_counter.most_common(20), columns=["词", "出现 thread 数"])
+        st.dataframe(topic_df, use_container_width=True, hide_index=True)
+
+    # 附件分布
+    st.markdown("#### 📎 附件分布")
+    att_msgs = sum(1 for t in data for m in t["messages"] if m["has_attachment"])
+    att_pct = round(100 * att_msgs / max(total_msgs, 1), 1)
+    st.markdown(f"- 有附件的信:**{att_msgs}** / {total_msgs} ({att_pct}%)")
+
+    ext_counter = Counter()
+    for t in data:
+        for m in t["messages"]:
+            for ext in m.get("attachment_types", []):
+                ext_counter[ext] += 1
+    if ext_counter:
+        ext_df = pd.DataFrame(ext_counter.most_common(10), columns=["副档名", "次数"])
+        st.dataframe(ext_df, use_container_width=True, hide_index=True)
+
+    # 寄信时间分布(本地时间)
+    st.markdown("#### ⏰ 寄信时间分布(每天哪几点最多)")
+    hour_counter = Counter()
+    weekday_counter = Counter()
+    for t in data:
+        for m in t["messages"]:
+            try:
+                d = parsedate_to_datetime(m["date"])
+                if d.tzinfo is None:
+                    d = d.replace(tzinfo=timezone.utc)
+                d_local = to_local(d)
+                hour_counter[d_local.hour] += 1
+                weekday_counter[d_local.strftime("%A")] += 1
+            except Exception:
+                pass
+    if hour_counter:
+        hour_data = sorted(hour_counter.items())
+        hour_df = pd.DataFrame(hour_data, columns=["小时(本地)", "信件数"])
+        st.dataframe(hour_df, use_container_width=True, hide_index=True)
+
+    if weekday_counter:
+        wd_order = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
+        wd_data = [(w, weekday_counter.get(w, 0)) for w in wd_order]
+        wd_df = pd.DataFrame(wd_data, columns=["星期", "信件数"])
+        st.dataframe(wd_df, use_container_width=True, hide_index=True)
+
+    # 拖延 thread 识别
+    st.markdown("#### ⚠️ 拖延 Thread(最后一封外部信距今 > 48 小时,且未被回覆)")
+    now = datetime.now(timezone.utc)
+    stuck = []
+    for t in data:
+        last_external_date = None
+        last_external_subject = t["subject"]
+        last_external_from = ""
+        for m in t["messages"]:
+            em = extract_email(m["from"])
+            if em and not is_internal(em):
+                try:
+                    d = parsedate_to_datetime(m["date"])
+                    if d.tzinfo is None:
+                        d = d.replace(tzinfo=timezone.utc)
+                    if not last_external_date or d > last_external_date:
+                        last_external_date = d
+                        last_external_subject = m["subject"] or t["subject"]
+                        last_external_from = m["from"]
+                except Exception:
+                    pass
+        if last_external_date is None:
+            continue
+
+        # 看 last_external 之后有没有内部回应
+        replied_after = False
+        for m in t["messages"]:
+            em = extract_email(m["from"])
+            if em and is_internal(em):
+                try:
+                    d = parsedate_to_datetime(m["date"])
+                    if d.tzinfo is None:
+                        d = d.replace(tzinfo=timezone.utc)
+                    if d > last_external_date:
+                        replied_after = True
+                        break
+                except Exception:
+                    pass
+
+        if not replied_after:
+            hours_since = (now - last_external_date).total_seconds() / 3600
+            if hours_since > 48:
+                stuck.append({
+                    "subject": last_external_subject[:60],
+                    "from": last_external_from[:40],
+                    "拖延小时": int(hours_since),
+                    "thread_id": t["thread_id"],
+                })
+
+    stuck.sort(key=lambda x: -x["拖延小时"])
+    st.markdown(f"**找到 {len(stuck)} 个拖延 thread**")
+    if stuck:
+        stuck_df = pd.DataFrame(stuck[:20])
+        st.dataframe(stuck_df, use_container_width=True, hide_index=True)
+    else:
+        st.success("✨ 没有拖延超过 48 小时的 thread")
+
+    # 总结洞察
+    st.markdown("#### 💡 给 PRD 的洞察")
+    insight_lines = []
+    if client_counter:
+        top_client = client_counter.most_common(1)[0]
+        insight_lines.append(f"- 最大客户:**{top_client[0]}**({top_client[1]} 封,{100*top_client[1]/sum(client_counter.values()):.1f}%)")
+    if topic_counter:
+        top_topic = topic_counter.most_common(1)[0]
+        insight_lines.append(f"- 最常见话题:**{top_topic[0]}**({top_topic[1]} 个 thread)")
+    if att_pct > 0:
+        insight_lines.append(f"- 附件比例:**{att_pct}%** 信件含附件")
+    if ext_counter:
+        top_ext = ext_counter.most_common(1)[0]
+        insight_lines.append(f"- 最常见附件类型:**.{top_ext[0]}**({top_ext[1]} 次)→ multi-modal 第一阶段优先支援")
+    if stuck:
+        insight_lines.append(f"- 过去 {actual_days} 天有 **{len(stuck)} 个 thread 拖延 > 48 小时未回覆**")
+    if insight_lines:
+        st.markdown("\n".join(insight_lines))
+
+
 def render_thread_inspector(user):
     """单 thread 偵錯工具:输入关键字,找到匹配的 thread,逐封显示处理细节。
 
@@ -2769,7 +3068,7 @@ def show_main_dashboard():
     dev_panel_keys = [
         "_source_demo", "_filter_trace", "_read_unread_debug",
         "_quality_check", "_phase6_probe", "_attachment_analysis",
-        "_thread_inspector",
+        "_thread_inspector", "_month_download", "_month_analysis",
     ]
 
     def _toggle_dev_panel(panel_key, also_pop=None):
@@ -2805,6 +3104,12 @@ def show_main_dashboard():
         if st.button("🔬 单 thread 偵錯(找漏掉的信)", use_container_width=True):
             _toggle_dev_panel("_thread_inspector")
             st.rerun()
+        if st.button("📥 下载 1 个月数据(PRD 用)", use_container_width=True):
+            _toggle_dev_panel("_month_download")
+            st.rerun()
+        if st.button("📊 1 个月 Pattern 分析", use_container_width=True):
+            _toggle_dev_panel("_month_analysis")
+            st.rerun()
         if st.button("🎨 「来源」栏 demo 预览", use_container_width=True):
             _toggle_dev_panel("_source_demo")
             st.rerun()
@@ -2826,6 +3131,14 @@ def show_main_dashboard():
 
     if st.session_state.get("_thread_inspector"):
         render_thread_inspector(user)
+        st.divider()
+
+    if st.session_state.get("_month_download"):
+        render_month_download(user)
+        st.divider()
+
+    if st.session_state.get("_month_analysis"):
+        render_month_analysis(user)
         st.divider()
 
     if st.session_state.get("_source_demo"):
