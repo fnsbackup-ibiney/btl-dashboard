@@ -1733,6 +1733,127 @@ def render_excel_update_panel(user, reminders=None):
                     st.rerun()
 
 
+def render_source_demo():
+    """Demo:用假资料展示「来源」栏看起来长怎样,让用户决定要不要做真版。
+
+    展示 3 种来源:🌍 外部、📨 Forward、🏢 内部
+    并且 Forward 的信件会显示「原始客户」抽出来当寄件者。
+    """
+    st.markdown("### 🎨 「來源」欄 — Demo 預覽")
+    st.caption(
+        "下面是**假資料**示範,展示加上「來源」欄之後 dashboard 會長什麼樣。"
+        "看完後你可以決定要不要做真實版本。"
+    )
+
+    st.markdown("#### 📋 Demo 1:**只加來源欄**(不抽原客戶)")
+    st.caption("Forward 信件的寄件者顯示為內部同事")
+    demo1 = pd.DataFrame([
+        {
+            "來源": "🌍 外部",
+            "寄件者": "franky@skyfashion-jx.com",
+            "主旨": "Re: SKY 80025 trims approval",
+            "等待": "1 天",
+        },
+        {
+            "來源": "📨 Forward",
+            "寄件者": "BTL FNS R <fns@ibiney.io>",
+            "主旨": "Fwd: WH/W26 - approval and comments",
+            "等待": "2 天",
+        },
+        {
+            "來源": "📨 Forward",
+            "寄件者": "BTL FNS SKY <jcam@ibiney.io>",
+            "主旨": "Re: SKY/W26 - 80028 trims approval",
+            "等待": "5 小時",
+        },
+        {
+            "來源": "🏢 內部",
+            "寄件者": "BTL Ivy <ivy@ibiney.io>",
+            "主旨": "new source of accessories - supplier SAB",
+            "等待": "8 小時",
+        },
+        {
+            "來源": "🌍 外部",
+            "寄件者": "Patrizia Brück <P.Brueck@fuchsschmitt.de>",
+            "主旨": "AW: Hangloops",
+            "等待": "1 天",
+        },
+    ])
+    st.dataframe(demo1, use_container_width=True, hide_index=True)
+    st.info(
+        "👀 **看 Demo 1 的問題**:第 2、3 行的 Forward 信,你只看到 `BTL FNS R / BTL FNS SKY` "
+        "(同事名稱),不知道**真正的客戶是誰**(其實是 Skyfashion 的人)。"
+    )
+
+    st.divider()
+
+    st.markdown("#### 📋 Demo 2:**抽出原客戶**(推薦版)")
+    st.caption("Forward 信件的寄件者顯示為真實客戶,emoji 提示這是 Forward 進來的")
+    demo2 = pd.DataFrame([
+        {
+            "來源": "🌍 外部",
+            "寄件者": "franky@skyfashion-jx.com",
+            "主旨": "Re: SKY 80025 trims approval",
+            "等待": "1 天",
+        },
+        {
+            "來源": "📨 Forward",
+            "寄件者": "franky@skyfashion-jx.com  (原)",  # 抽出來
+            "主旨": "Fwd: WH/W26 - approval and comments",
+            "等待": "2 天",
+        },
+        {
+            "來源": "📨 Forward",
+            "寄件者": "tony@skyfashion-jx.com  (原)",
+            "主旨": "Re: SKY/W26 - 80028 trims approval",
+            "等待": "5 小時",
+        },
+        {
+            "來源": "🏢 內部",
+            "寄件者": "BTL Ivy <ivy@ibiney.io>",
+            "主旨": "new source of accessories - supplier SAB",
+            "等待": "8 小時",
+        },
+        {
+            "來源": "🌍 外部",
+            "寄件者": "Patrizia Brück <P.Brueck@fuchsschmitt.de>",
+            "主旨": "AW: Hangloops",
+            "等待": "1 天",
+        },
+    ])
+    st.dataframe(demo2, use_container_width=True, hide_index=True)
+    st.success(
+        "✅ **Demo 2 的好處**:第 2、3 行你**直接看到客戶是 Skyfashion 的 franky / tony**,"
+        "客戶分類也會自動歸到「Skyfashion」(否則會歸到「OTHER」)。\n\n"
+        "「(原)」是個小提示,告訴你這個寄件者是從 Forward 內文裡抽出來的,"
+        "不是直接收件。"
+    )
+
+    st.divider()
+
+    st.markdown("#### 🎯 兩個版本比較")
+    compare = pd.DataFrame([
+        ["看到客戶名", "❌ 看不到", "✅ 一眼看到"],
+        ["客戶分類準確", "❌ 全歸到 OTHER", "✅ 自動歸到 Skyfashion / Fuchsschmitt"],
+        ["要點開信才知道內容", "✅ 是", "❌ 不用"],
+        ["實作複雜度", "簡單(10 分鐘)", "中等(30 分鐘)"],
+        ["實用度", "🟡 中", "🟢 高"],
+    ], columns=["維度", "Demo 1 (簡單)", "Demo 2 (推薦)"])
+    st.dataframe(compare, use_container_width=True, hide_index=True)
+
+    st.divider()
+
+    st.markdown("#### 🤔 看完 demo 你的選擇")
+    st.markdown("""
+看完上面兩個版本,跟 Claude 說一句:
+
+- **「做 Demo 2」** — 完整版,有原客戶抽取
+- **「做 Demo 1」** — 簡單版,只加 emoji
+- **「都不要,先這樣」** — 維持現狀
+- **「我還想改 demo,我覺得 ___」** — 提你想要的調整
+    """)
+
+
 def trace_filter_pipeline(creds_dict, current_user_email, search_days_override=None):
     """逐层追踪过滤流程,记录每封信被哪个规则挡掉。
 
@@ -2102,6 +2223,8 @@ def show_main_dashboard():
 
     # 开发/PRD 用工具(收在 expander 里,不影响日常使用)
     with st.sidebar.expander("🧪 开发工具"):
+        if st.button("🎨 「來源」欄 demo 預覽"):
+            st.session_state["_source_demo"] = True
         if st.button("🕵️ 过滤追踪(看哪些信被挡掉)"):
             st.session_state["_filter_trace"] = True
             st.session_state.pop("_filter_trace_result", None)
@@ -2115,6 +2238,13 @@ def show_main_dashboard():
         if st.button("📊 附件分析(PRD 用)"):
             st.session_state["_attachment_analysis"] = True
             st.session_state.pop("_attachment_stats", None)  # 重新分析
+
+    if st.session_state.get("_source_demo"):
+        render_source_demo()
+        if st.button("关闭 demo 预览"):
+            st.session_state.pop("_source_demo", None)
+            st.rerun()
+        st.divider()
 
     if st.session_state.get("_filter_trace"):
         render_filter_trace(user)
