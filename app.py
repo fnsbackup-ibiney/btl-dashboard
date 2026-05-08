@@ -2638,6 +2638,15 @@ def show_main_dashboard():
         ]
     view_df = view_df.reset_index(drop=True)
 
+    # 集中显示:同寄件者的信全部排在一起 (保留原本「未读优先 / 当日优先 / 时长」的次要排序)
+    # 用「该寄件者第一次出现的位置」当 group_rank,稳定排序
+    sender_first_idx = {}
+    for i, s in enumerate(view_df["寄件者"]):
+        if s not in sender_first_idx:
+            sender_first_idx[s] = i
+    view_df["_group_rank"] = view_df["寄件者"].map(sender_first_idx)
+    view_df = view_df.sort_values("_group_rank", kind="stable").drop(columns=["_group_rank"]).reset_index(drop=True)
+
     sender_counts = view_df["寄件者"].value_counts().to_dict()
     deduped = []
     prev = None
