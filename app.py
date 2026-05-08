@@ -374,12 +374,21 @@ def fetch_pending_emails(creds_dict, current_user_email):
         # 整个 thread 拼成完整对话纪录,让 Gemini 看到全部脉络
         thread_text = build_thread_transcript(messages_meta)
 
+        # Debug 用:抓最后一封外部信的原始 labelIds(看是不是 Gmail 端就标错)
+        last_external_meta = messages_meta[last_external_idx]
+        last_external_labels = last_external_meta.get("labelIds", [])
+
         items.append({
             "msg_id": last_msg["id"], "subject": last_msg["subject"],
             "from": last_msg["from"], "date": last_msg["date"],
             "body": last_msg["body"], "thread_text": thread_text,
             "is_unread": last_msg["is_unread"],
             "is_today": is_today, "age_hours": age_hours,
+            # Debug 资讯
+            "_debug_thread_id": t["id"],
+            "_debug_msg_count": len(messages_meta),
+            "_debug_last_external_idx": last_external_idx,
+            "_debug_last_external_labels": last_external_labels,
         })
 
     items.sort(key=lambda x: (
@@ -1724,6 +1733,88 @@ def render_excel_update_panel(user, reminders=None):
                     st.rerun()
 
 
+def render_read_unread_debug(user):
+    """Debug 面板:列出每封信的 Gmail labels + 系统判断结果。
+
+    专门用来验证「未读未回 / 已读未回」的正确性。
+    显示原始 labelIds、计算结果、是否一致。
+    """
+    st.markdown("### 🔍 已读/未读 偵錯面板")
+    st.caption(
+        "列出 dashboard 显示的每封信件,显示 Gmail 端的原始 labels 和系统判断。"
+        "对比可以看出系统是否准确反映 Gmail 状态。"
+    )
+
+    items = st.session_state.get("pending_items", [])
+    if not items:
+        st.warning("dashboard 还没抓信,请等抓完再来")
+        return
+
+    # 总览
+    unread_count = sum(1 for it in items if it.get("is_unread"))
+    read_count = len(items) - unread_count
+    c1, c2, c3 = st.columns(3)
+    c1.metric("总信件数", len(items))
+    c2.metric("🔴 未读未回", unread_count)
+    c3.metric("🟡 已读未回", read_count)
+
+    st.divider()
+
+    # 每封信的 debug 资讯
+    rows = []
+    for idx, it in enumerate(items, start=1):
+        labels = it.get("_debug_last_external_labels", [])
+        labels_str = ", ".join(labels) if labels else "(no labels)"
+        is_unread = it.get("is_unread", False)
+        has_unread_label = "UNREAD" in labels
+
+        # 一致性检查
+        if is_unread == has_unread_label:
+            consistency = "✅ 一致"
+        else:
+            consistency = "❌ 不一致"
+
+        rows.append({
+            "#": idx,
+            "Subject": it["subject"][:50],
+            "is_unread (系统判断)": "🔴 未读" if is_unread else "🟡 已读",
+            "UNREAD label (Gmail 原始)": "✅" if has_unread_label else "❌",
+            "判断一致性": consistency,
+            "Thread 长度": it.get("_debug_msg_count", 0),
+            "完整 labels": labels_str,
+        })
+
+    df = pd.DataFrame(rows)
+    st.dataframe(df, use_container_width=True, hide_index=True)
+
+    st.markdown("---")
+    st.markdown("#### 🧐 解读结果")
+    st.markdown(
+        """
+- **一致**:系统判断 = Gmail 标签 → 正确反映 Gmail 状态
+- **不一致**:可能是 Gmail labels 之外的因素影响判断 → 需要查
+- 如果觉得「系统说未读但其实我已读过」 → 看「UNREAD label」栏:
+  - 仍是 ✅ → Gmail 那封信真的还有 UNREAD 标签(可能 mobile preview 不算 open)
+  - 是 ❌ → 那是系统 bug,要 debug
+- 如果觉得「系统说已读但我从没打开」 → 看「UNREAD label」栏:
+  - 是 ❌ → Gmail 那封信被标 read 了(有人打开过 / API fetch 自动标了)
+  - 是 ✅ → 系统 bug
+        """
+    )
+
+    # 可以下载完整 JSON 给 dev 看
+    import json as _json
+    full_dump = []
+    for it in items:
+        full_dump.append({k: v for k, v in it.items() if not k.startswith("body") and not k.startswith("thread_text")})
+    st.download_button(
+        "⬇️ 下載完整 debug dump (JSON)",
+        data=_json.dumps(full_dump, default=str, indent=2, ensure_ascii=False),
+        file_name=f"btl_debug_dump_{user.get('email', 'user').split('@')[0]}.json",
+        mime="application/json",
+    )
+
+
 def show_main_dashboard():
     user = st.session_state["user"]
     user_email = user["email"]
@@ -1748,6 +1839,8 @@ def show_main_dashboard():
 
     # 开发/PRD 用工具(收在 expander 里,不影响日常使用)
     with st.sidebar.expander("🧪 开发工具"):
+        if st.button("🔍 已读/未读 偵錯"):
+            st.session_state["_read_unread_debug"] = True
         if st.button("📋 Quality Report(系统验证)"):
             st.session_state["_quality_check"] = True
             st.session_state.pop("_quality_report", None)  # 重新跑
@@ -1756,6 +1849,13 @@ def show_main_dashboard():
         if st.button("📊 附件分析(PRD 用)"):
             st.session_state["_attachment_analysis"] = True
             st.session_state.pop("_attachment_stats", None)  # 重新分析
+
+    if st.session_state.get("_read_unread_debug"):
+        render_read_unread_debug(user)
+        if st.button("关闭偵錯面板"):
+            st.session_state.pop("_read_unread_debug", None)
+            st.rerun()
+        st.divider()
 
     if st.session_state.get("_quality_check"):
         render_quality_report(user)
