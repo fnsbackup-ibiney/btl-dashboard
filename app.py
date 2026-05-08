@@ -2373,8 +2373,8 @@ def show_main_dashboard():
         st.write("")
         new_days = st.selectbox(
             "🗓️ 搜寻范围",
-            options=[1, 3, 5, 7, 14],
-            index=[1, 3, 5, 7, 14].index(current_days) if current_days in [1, 3, 5, 7, 14] else 1,
+            options=[1, 3, 5, 7],
+            index=[1, 3, 5, 7].index(current_days) if current_days in [1, 3, 5, 7] else 1,
             help="改变后会自动重新抓取 Gmail",
         )
         if new_days != current_days:
