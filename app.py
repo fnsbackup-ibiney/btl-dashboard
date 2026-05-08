@@ -34,7 +34,11 @@ GEMINI_API_URL = (
     f"{GEMINI_MODEL}:generateContent?key={GEMINI_API_KEY}"
 )
 
-BUSINESS_KEYWORDS = ["SKY", "FNS", "BTL", "WH", "FCL", "Sendung", "Parcel", "Order"]
+BUSINESS_KEYWORDS = [
+    "SKY", "FNS", "BTL", "WH", "FCL", "Sendung", "Parcel", "Order",
+    # 扩充:款号 / 季节码 / 客户代号
+    "YAN", "BIN", "SAB", "FS", "BX", "Hangloop", "S27", "W26", "S26", "W27",
+]
 NOISE_DOMAINS = ["blot.new", "cloudhq.net", "bolt.eu"]
 INTERNAL_DOMAIN = "ibiney.io"
 SEARCH_DAYS = 3
@@ -287,6 +291,116 @@ def extract_plain_body(payload):
     return ""
 
 
+def extract_forwarded_sender(body):
+    """从转寄信件的内文里抽出原始客户的 email + 名称。
+
+    支援格式:
+      ----- Forwarded message -----
+      From: franky@skyfashion-jx.com
+      ...
+
+    或:
+      Von: franky@skyfashion-jx.com    (德文 Forward)
+      Gesendet: ...
+
+    或:
+      原始邮件
+      发件人:franky@skyfashion-jx.com
+
+    回传 dict {"email": ..., "name": ..., "raw": ...} 或 None
+    """
+    if not body:
+        return None
+
+    # 切掉前面的内文,从 forward 区块开始找
+    forward_markers = [
+        r"-{3,}\s*Forwarded message\s*-{3,}",
+        r"-{3,}\s*Original Message\s*-{3,}",
+        r"-{3,}\s*转发邮件\s*-{3,}",
+        r"-{3,}\s*原始邮件\s*-{3,}",
+        r"Begin forwarded message:",
+        r"Weitergeleitete Nachricht",   # 德文 forward
+    ]
+    forward_start = None
+    for marker in forward_markers:
+        m = re.search(marker, body, re.IGNORECASE)
+        if m:
+            forward_start = m.end()
+            break
+
+    # 即使没找到 forward marker,也试看看有没有 From: 在内文里
+    search_region = body[forward_start:] if forward_start else body[:3000]
+
+    # 匹配 From / Von / 发件人
+    from_patterns = [
+        r"From:\s*(.+?)(?:\r?\n|$)",
+        r"Von:\s*(.+?)(?:\r?\n|$)",
+        r"发件人[::]\s*(.+?)(?:\r?\n|$)",
+        r"寄件者[::]\s*(.+?)(?:\r?\n|$)",
+    ]
+    for pat in from_patterns:
+        m = re.search(pat, search_region, re.IGNORECASE)
+        if m:
+            from_line = m.group(1).strip()
+            # 抽 email
+            email = extract_email(from_line)
+            if email and "@" in email:
+                # 名称 = email 之外的部分
+                name_part = re.sub(r"<[^>]+>", "", from_line).strip().strip('"').strip()
+                return {
+                    "email": email,
+                    "name": name_part if name_part else email.split("@")[0],
+                    "raw": from_line,
+                }
+    return None
+
+
+def determine_source(messages_meta, top_level_from):
+    """判断这个 thread 的「来源」分类。
+
+    回传 (emoji_label, real_external_email, real_external_name)
+      - "🌍 外部"     : 客户直接寄给我们,real_external_* 是客户
+      - "📨 转寄"     : 同事 forward 进来的,real_external_* 是从内文抽的原客户
+      - "🏢 内部"     : 全 thread 都是内部讨论,real_external_* 是 None
+    """
+    # 看最后一封的 from
+    last_msg = messages_meta[-1]
+    last_hd = {h["name"]: h["value"] for h in last_msg.get("payload", {}).get("headers", [])}
+    last_from_raw = last_hd.get("From", "")
+    last_email = extract_email(last_from_raw)
+    last_subject = last_hd.get("Subject", "")
+
+    # 检查 thread 中有没有「真正外部」的信
+    has_real_external = False
+    real_external_from = ""
+    for m in messages_meta:
+        hd = {h["name"]: h["value"] for h in m.get("payload", {}).get("headers", [])}
+        em = extract_email(hd.get("From", ""))
+        if em and not is_internal(em):
+            has_real_external = True
+            real_external_from = hd.get("From", "")
+            break
+
+    if has_real_external:
+        return ("🌍 外部", extract_email(real_external_from), real_external_from)
+
+    # 没有真正外部信件 → 看主旨是否带 Fwd / 转发标记
+    is_forward = bool(re.match(r"^\s*(Fwd|FW|WG|Weitergeleitet|转发|轉發)[:：]", last_subject, re.IGNORECASE))
+
+    if is_forward:
+        # 试着从最后一封信(或任一信)的内文里抽原客户
+        for m in reversed(messages_meta):
+            body = extract_plain_body(m.get("payload", {}))
+            fwd_info = extract_forwarded_sender(body)
+            if fwd_info:
+                return ("📨 转寄", fwd_info["email"], fwd_info["raw"])
+        # Fwd: 但抽不到原客户(罕见)
+        return ("📨 转寄", "", "(原始客户未识别)")
+
+    # 全内部 thread,非 forward 标记
+    return ("🏢 内部", "", "")
+
+
 def build_thread_transcript(messages_meta):
     """把整个 thread 串成一份「对话纪录」文字,给 Gemini 做有完整脉络的摘要。
 
@@ -337,58 +451,88 @@ def fetch_pending_emails(creds_dict, current_user_email):
         if not messages_meta:
             continue
 
-        last_external_idx = -1
-        for i in range(len(messages_meta) - 1, -1, -1):
-            from_h = next(
-                (h["value"] for h in messages_meta[i].get("payload", {}).get("headers", [])
-                 if h["name"] == "From"), "",
-            )
-            from_email = extract_email(from_h)
-            if from_email and not is_internal(from_email):
-                last_external_idx = i
-                break
-        if last_external_idx == -1:
+        # 判断这个 thread 的「来源」(外部 / 转寄 / 内部)
+        # determine_source 会扫整 thread,优先找真正外部信,
+        # 找不到就检查 Fwd: 标记 + 内文抽原客户
+        source_label, real_external_email, real_external_from = determine_source(
+            messages_meta, ""
+        )
+
+        # 找最后一封「应该当作外部信」的 message:
+        #   外部:最后一封外部寄件者
+        #   转寄:最后一封(因为整 thread 都是 ibiney,但是 Fwd: 的)
+        #   内部:最后一封
+        last_target_idx = -1
+        if source_label == "🌍 外部":
+            for i in range(len(messages_meta) - 1, -1, -1):
+                hd = {h["name"]: h["value"] for h in messages_meta[i].get("payload", {}).get("headers", [])}
+                em = extract_email(hd.get("From", ""))
+                if em and not is_internal(em):
+                    last_target_idx = i
+                    break
+        else:
+            # 转寄 / 内部:取最后一封 (不论 ibiney.io)
+            last_target_idx = len(messages_meta) - 1
+
+        if last_target_idx < 0:
             continue
 
+        # B 逻辑:看「在 last_target 之后,当前 user 是否已回过」
+        # 转寄 / 内部 thread:看 last_target 是不是 当前 user 自己 → 是的话 = 已回
+        # 外部 thread:看 last_target 之后有没有 user 回过
         user_replied = False
-        for j in range(last_external_idx + 1, len(messages_meta)):
-            from_h = next(
-                (h["value"] for h in messages_meta[j].get("payload", {}).get("headers", [])
-                 if h["name"] == "From"), "",
-            )
-            from_email = extract_email(from_h)
-            if from_email == current_user_email.lower():
+        if source_label == "🌍 外部":
+            for j in range(last_target_idx + 1, len(messages_meta)):
+                hd = {h["name"]: h["value"] for h in messages_meta[j].get("payload", {}).get("headers", [])}
+                em = extract_email(hd.get("From", ""))
+                if em == current_user_email.lower():
+                    user_replied = True
+                    break
+        else:
+            # 转寄 / 内部:看最后一封是不是 current user 寄的
+            hd_last = {h["name"]: h["value"] for h in messages_meta[last_target_idx].get("payload", {}).get("headers", [])}
+            last_em = extract_email(hd_last.get("From", ""))
+            if last_em == current_user_email.lower():
                 user_replied = True
-                break
         if user_replied:
             continue
 
-        last_msg = parse_gmail_message(service, messages_meta[last_external_idx]["id"])
-        last_email = extract_email(last_msg["from"])
-        if is_noise_domain(last_email):
-            continue
+        last_msg = parse_gmail_message(service, messages_meta[last_target_idx]["id"])
+
+        # 噪音域名过滤(只对外部 thread 检查)
+        if source_label == "🌍 外部":
+            if is_noise_domain(extract_email(last_msg["from"])):
+                continue
+
+        # 决定显示用的「寄件者」:
+        # 外部 → 真实寄件者
+        # 转寄 → 抽出来的原始客户(real_external_from)
+        # 内部 → 真实寄件者
+        if source_label == "📨 转寄" and real_external_from:
+            display_from = f"{real_external_from} (原)"
+            display_email = real_external_email
+        else:
+            display_from = last_msg["from"]
+            display_email = extract_email(last_msg["from"])
 
         is_today = last_msg["date"] >= today_start
         age_hours = int((now - last_msg["date"]).total_seconds() // 3600)
-
-        # 整个 thread 拼成完整对话纪录,让 Gemini 看到全部脉络
         thread_text = build_thread_transcript(messages_meta)
-
-        # Debug 用:抓最后一封外部信的原始 labelIds(看是不是 Gmail 端就标错)
-        last_external_meta = messages_meta[last_external_idx]
-        last_external_labels = last_external_meta.get("labelIds", [])
+        last_target_labels = messages_meta[last_target_idx].get("labelIds", [])
 
         items.append({
             "msg_id": last_msg["id"], "subject": last_msg["subject"],
-            "from": last_msg["from"], "date": last_msg["date"],
+            "from": display_from, "from_email": display_email,
+            "raw_from": last_msg["from"],   # 真实 Gmail From 栏(转寄信件就是同事)
+            "source": source_label,         # 🌍 外部 / 📨 转寄 / 🏢 内部
+            "date": last_msg["date"],
             "body": last_msg["body"], "thread_text": thread_text,
             "is_unread": last_msg["is_unread"],
             "is_today": is_today, "age_hours": age_hours,
-            # Debug 资讯
             "_debug_thread_id": t["id"],
             "_debug_msg_count": len(messages_meta),
-            "_debug_last_external_idx": last_external_idx,
-            "_debug_last_external_labels": last_external_labels,
+            "_debug_last_target_idx": last_target_idx,
+            "_debug_last_external_labels": last_target_labels,
         })
 
     items.sort(key=lambda x: (
@@ -2340,6 +2484,7 @@ def show_main_dashboard():
             badges.append("🔵 当日新进")
         rows.append({
             "msg_id": it["msg_id"],
+            "来源": it.get("source", "🌍 外部"),
             "优先级": " / ".join(badges),
             "寄件者": it["from"],
             "标题": grouped_titles[it["msg_id"]],
@@ -2382,24 +2527,34 @@ def show_main_dashboard():
 
     st.divider()
 
-    fc1, fc2, fc3 = st.columns([1, 1, 2])
+    fc1, fc2, fc3, fc4 = st.columns([1, 1, 1, 2])
     with fc1:
+        source_count_map = df["来源"].value_counts().to_dict()
+        source_opts = [
+            f"{s} ({source_count_map.get(s, 0)})"
+            for s in ["🌍 外部", "📨 转寄", "🏢 内部"]
+        ]
+        show_sources_l = st.multiselect("来源(选填)", source_opts, placeholder="不勾 = 全部")
+    with fc2:
         tag_count_map = {
             "🔴 未读未回": unread_cnt, "🟡 已读未回": read_cnt, "🔵 当日新进": today_cnt,
         }
         tag_opts = [f"{t} ({tag_count_map[t]})" for t in ["🔴 未读未回", "🟡 已读未回", "🔵 当日新进"]]
         show_tags_l = st.multiselect("状态(选填)", tag_opts, placeholder="不勾 = 全部")
-    with fc2:
+    with fc3:
         dept_count_map = df["部门"].value_counts().to_dict()
         dept_opts = [f"{d} ({dept_count_map.get(d, 0)})" for d in ALL_DEPARTMENTS]
         show_depts_l = st.multiselect("部门(选填)", dept_opts, placeholder="不勾 = 全部")
-    with fc3:
+    with fc4:
         keyword = st.text_input("标题 / 寄件者搜寻(选填)")
 
+    show_sources = [s.rsplit(" (", 1)[0] for s in show_sources_l]
     show_tags = [t.rsplit(" (", 1)[0] for t in show_tags_l]
     show_depts = [d.rsplit(" (", 1)[0] for d in show_depts_l]
 
     view_df = df.copy()
+    if show_sources:
+        view_df = view_df[view_df["来源"].isin(show_sources)]
     if show_tags:
         pat = "|".join([t.split(" ")[1] for t in show_tags])
         view_df = view_df[view_df["优先级"].str.contains(pat, na=False)]
@@ -2441,8 +2596,9 @@ def show_main_dashboard():
         hide_index=True,
         on_select="rerun",
         selection_mode="single-row",
-        column_order=["寄件者", "部门", "优先级", "标题", "收信日期", "等待时长", "邮件连结"],
+        column_order=["来源", "寄件者", "部门", "优先级", "标题", "收信日期", "等待时长", "邮件连结"],
         column_config={
+            "来源": st.column_config.TextColumn(width="small", help="🌍 外部=客户直接寄 / 📨 转寄=同事转给你 / 🏢 内部=同事讨论"),
             "寄件者": st.column_config.TextColumn(width="medium"),
             "部门": st.column_config.TextColumn(width="medium"),
             "优先级": st.column_config.TextColumn(width="medium"),
