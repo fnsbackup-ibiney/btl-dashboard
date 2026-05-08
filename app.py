@@ -36,8 +36,11 @@ GEMINI_API_URL = (
 
 BUSINESS_KEYWORDS = [
     "SKY", "FNS", "BTL", "WH", "FCL", "Sendung", "Parcel", "Order",
-    # 扩充:款号 / 季节码 / 客户代号
-    "YAN", "BIN", "SAB", "FS", "BX", "Hangloop", "S27", "W26", "S26", "W27",
+    # 扩充:款号 / 季节码 / 客户代号 + 单复数
+    "YAN", "BIN", "SAB", "FS", "BX", "Hangloop", "Hangloops",
+    "S27", "W26", "S26", "W27",
+    # 一些常见客户用词
+    "approval", "comments", "delivery", "PI", "PO", "sample", "samples",
 ]
 
 # 显示用的时区(UTC+8 = 香港/台北/中国标准时间),跟 Gmail 显示对齐
