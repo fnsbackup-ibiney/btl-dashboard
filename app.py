@@ -40,6 +40,18 @@ BUSINESS_KEYWORDS = [
     "YAN", "BIN", "SAB", "FS", "BX", "Hangloop", "S27", "W26", "S26", "W27",
 ]
 
+# 显示用的时区(UTC+8 = 香港/台北/中国标准时间),跟 Gmail 显示对齐
+DISPLAY_TZ = timezone(timedelta(hours=8))
+
+
+def to_local(dt):
+    """把 UTC datetime 转成 UTC+8 本地时间。"""
+    if dt is None:
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(DISPLAY_TZ)
+
 # 关键回信人:**只有这些人**回客户,thread 才算「已处理」
 # 其他同事(BTL FNS R / BTL FNS SKY 等)回的不算
 KEY_REPLIERS = ["david@ibiney.io", "ivy@ibiney.io"]
@@ -629,6 +641,14 @@ def fetch_pending_emails(creds_dict, current_user_email, search_days=None):
 
         last_msg = parse_gmail_message(service, messages_meta[last_target_idx]["id"])
 
+        # 主旨:用 thread「第一封信」的主旨,跟 Gmail thread 标题一致
+        # (避免最后一封是 "Re:" / "AW:" 之类的回信前缀,看起来跟 Gmail 不同)
+        thread_first_hd = {
+            h["name"]: h["value"]
+            for h in messages_meta[0].get("payload", {}).get("headers", [])
+        }
+        thread_first_subject = thread_first_hd.get("Subject", last_msg["subject"])
+
         # 噪音域名过滤(只对外部 thread 检查)
         if source_label == "🌍 外部":
             if is_noise_domain(extract_email(last_msg["from"])):
@@ -659,7 +679,9 @@ def fetch_pending_emails(creds_dict, current_user_email, search_days=None):
         last_target_labels = messages_meta[last_target_idx].get("labelIds", [])
 
         items.append({
-            "msg_id": last_msg["id"], "subject": last_msg["subject"],
+            "msg_id": last_msg["id"],
+            "subject": thread_first_subject,         # 跟 Gmail thread 标题一致(thread 第一封主旨)
+            "subject_last": last_msg["subject"],     # 最后一封信主旨(供调试 / AI 等需要时用)
             "from": display_from, "from_email": display_email,
             "raw_from": last_msg["from"],   # 真实 Gmail From 栏(转寄信件就是同事)
             "source": source_label,         # 🌍 外部 / 📨 转寄 / 🏢 内部
@@ -2497,7 +2519,7 @@ def render_thread_inspector(user):
 
             rows.append({
                 "#": i + 1,
-                "日期": mdate.strftime("%Y-%m-%d %H:%M") if mdate else "(无)",
+                "日期": to_local(mdate).strftime("%Y-%m-%d %H:%M") if mdate else "(无)",
                 "在窗口内": "✅" if in_window else "❌ 出窗口",
                 "From": from_h[:50],
                 "Email": em,
@@ -2573,7 +2595,7 @@ def render_thread_inspector(user):
 
         st.info(verdict)
         if last_external_date:
-            st.caption(f"最后一封外部信日期: {last_external_date.strftime('%Y-%m-%d %H:%M')}")
+            st.caption(f"最后一封外部信日期: {to_local(last_external_date).strftime('%Y-%m-%d %H:%M')}(本地时间)")
         if key_handle_msg:
             kh_hd = {h["name"]: h["value"] for h in key_handle_msg.get("payload", {}).get("headers", [])}
             st.caption(f"David/Ivy 处理时间: {kh_hd.get('Date', '?')}")
@@ -2883,7 +2905,7 @@ def show_main_dashboard():
             "优先级": " / ".join(badges),
             "寄件者": it["from"],
             "标题": grouped_titles[it["msg_id"]],
-            "收信日期": it["date"].strftime("%Y-%m-%d %H:%M"),
+            "收信日期": to_local(it["date"]).strftime("%Y-%m-%d %H:%M"),
             "等待时长": format_age(it["age_hours"]),
             "邮件连结": f"https://mail.google.com/mail/u/0/#inbox/{it['msg_id']}",
             "_body": it["body"],
