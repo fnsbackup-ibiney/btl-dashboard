@@ -2396,22 +2396,60 @@ def show_main_dashboard():
             st.rerun()
 
     # 开发/PRD 用工具(收在 expander 里,不影响日常使用)
+    # 所有 dev 面板的 session_state key 列表
+    dev_panel_keys = [
+        "_source_demo", "_filter_trace", "_read_unread_debug",
+        "_quality_check", "_phase6_probe", "_attachment_analysis",
+    ]
+
+    def _toggle_dev_panel(panel_key, also_pop=None):
+        """点一下:开;再点一下:关。同时关掉其他面板,避免堆叠。"""
+        if st.session_state.get(panel_key):
+            # 已开 → 关
+            st.session_state.pop(panel_key, None)
+            if also_pop:
+                for k in also_pop:
+                    st.session_state.pop(k, None)
+        else:
+            # 未开 → 关其他、开自己
+            for k in dev_panel_keys:
+                st.session_state.pop(k, None)
+            st.session_state[panel_key] = True
+            if also_pop:
+                for k in also_pop:
+                    st.session_state.pop(k, None)
+
     with st.sidebar.expander("🧪 开发工具"):
-        if st.button("🎨 「来源」栏 demo 预览"):
-            st.session_state["_source_demo"] = True
-        if st.button("🕵️ 过滤追踪(看哪些信被挡掉)"):
-            st.session_state["_filter_trace"] = True
-            st.session_state.pop("_filter_trace_result", None)
-        if st.button("🔍 已读/未读 侦错"):
-            st.session_state["_read_unread_debug"] = True
-        if st.button("📋 Quality Report(系统验证)"):
-            st.session_state["_quality_check"] = True
-            st.session_state.pop("_quality_report", None)  # 重新跑
-        if st.button("Phase 6 Firestore 写入测试"):
-            st.session_state["_phase6_probe"] = True
-        if st.button("📊 附件分析(PRD 用)"):
-            st.session_state["_attachment_analysis"] = True
-            st.session_state.pop("_attachment_stats", None)  # 重新分析
+        # 一键回首页:任何面板开启时都能关掉
+        any_panel_open = any(st.session_state.get(k) for k in dev_panel_keys)
+        if any_panel_open:
+            if st.button("🏠 回 dashboard 首页", use_container_width=True, type="primary"):
+                for k in dev_panel_keys:
+                    st.session_state.pop(k, None)
+                st.session_state.pop("_quality_report", None)
+                st.session_state.pop("_attachment_stats", None)
+                st.session_state.pop("_filter_trace_result", None)
+                st.rerun()
+            st.divider()
+
+        if st.button("🎨 「来源」栏 demo 预览", use_container_width=True):
+            _toggle_dev_panel("_source_demo")
+            st.rerun()
+        if st.button("🕵️ 过滤追踪(看哪些信被挡掉)", use_container_width=True):
+            _toggle_dev_panel("_filter_trace", also_pop=["_filter_trace_result"])
+            st.rerun()
+        if st.button("🔍 已读/未读 侦错", use_container_width=True):
+            _toggle_dev_panel("_read_unread_debug")
+            st.rerun()
+        if st.button("📋 Quality Report(系统验证)", use_container_width=True):
+            _toggle_dev_panel("_quality_check", also_pop=["_quality_report"])
+            st.rerun()
+        if st.button("Phase 6 Firestore 写入测试", use_container_width=True):
+            _toggle_dev_panel("_phase6_probe")
+            st.rerun()
+        if st.button("📊 附件分析(PRD 用)", use_container_width=True):
+            _toggle_dev_panel("_attachment_analysis", also_pop=["_attachment_stats"])
+            st.rerun()
 
     if st.session_state.get("_source_demo"):
         render_source_demo()
