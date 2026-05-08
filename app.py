@@ -521,6 +521,20 @@ def fetch_pending_emails(creds_dict, current_user_email, search_days=None):
             if is_noise_domain(extract_email(last_msg["from"])):
                 continue
 
+        # 排除自动回覆 (out-of-office reply)
+        # 主旨开头有 "Automatische Antwort:" / "Auto Reply:" / "Automatic reply:" 等
+        subject_lower = (last_msg["subject"] or "").lower()
+        auto_reply_markers = [
+            "automatische antwort",  # 德文
+            "automatic reply",       # 英文
+            "auto reply",            # 英文短版
+            "out of office",         # 英文
+            "abwesenheit",           # 德文 absence
+            "自动回覆", "自动回复",  # 中文
+        ]
+        if any(m in subject_lower for m in auto_reply_markers):
+            continue
+
         # Demo 1 简单版:寄件者一律显示 Gmail 表面寄件者(不抽原客户)
         # 来源资讯靠左侧「来源」栏 emoji 区分:🌍 外部 / 📨 转寄 / 🏢 内部
         display_from = last_msg["from"]
@@ -2638,8 +2652,12 @@ def show_main_dashboard():
         ]
     view_df = view_df.reset_index(drop=True)
 
+    # 把空白 / NaN 寄件者填上预设值,避免显示空白
+    view_df["寄件者"] = view_df["寄件者"].fillna("").apply(
+        lambda s: s if str(s).strip() else "(未知寄件者)"
+    )
+
     # 集中显示:同寄件者的信全部排在一起 (保留原本「未读优先 / 当日优先 / 时长」的次要排序)
-    # 用「该寄件者第一次出现的位置」当 group_rank,稳定排序
     sender_first_idx = {}
     for i, s in enumerate(view_df["寄件者"]):
         if s not in sender_first_idx:
@@ -2649,7 +2667,7 @@ def show_main_dashboard():
 
     sender_counts = view_df["寄件者"].value_counts().to_dict()
     deduped = []
-    prev = None
+    prev = "__INIT_NEVER_MATCH__"   # 用一个绝不会出现的 sentinel,避免空字串误判为「跟前一行同」
     for s in view_df["寄件者"]:
         if s == prev:
             deduped.append("")
