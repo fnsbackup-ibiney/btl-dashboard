@@ -5,7 +5,7 @@ import base64
 import re
 import urllib.parse
 from collections import Counter
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from email.utils import parsedate_to_datetime
 
 import pandas as pd
@@ -430,10 +430,14 @@ def build_thread_transcript(messages_meta):
     return transcript
 
 
-def fetch_pending_emails(creds_dict, current_user_email):
+def fetch_pending_emails(creds_dict, current_user_email, search_days=None):
+    days = search_days or SEARCH_DAYS
     creds = credentials_from_dict(creds_dict)
     service = build("gmail", "v1", credentials=creds, cache_discovery=False)
-    query = build_gmail_query()
+    # query 也用动态 days,避免 Gmail 端漏抓
+    kw_clause = " OR ".join([f"subject:{k}" for k in BUSINESS_KEYWORDS])
+    noise_clause = " ".join([f"-from:{d}" for d in NOISE_DOMAINS])
+    query = f"in:inbox newer_than:{days}d ({kw_clause}) {noise_clause}"
     threads_resp = service.users().threads().list(
         userId="me", q=query, maxResults=200
     ).execute()
@@ -442,6 +446,8 @@ def fetch_pending_emails(creds_dict, current_user_email):
     items = []
     today_start = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)
     now = datetime.now(timezone.utc)
+    # 严格 days 窗口:thread 中只要有一封超过这个范围,就不当代表
+    cutoff = now - timedelta(days=days)
 
     for t in threads:
         thread_full = service.users().threads().get(
@@ -452,29 +458,40 @@ def fetch_pending_emails(creds_dict, current_user_email):
             continue
 
         # 判断这个 thread 的「来源」(外部 / 转寄 / 内部)
-        # determine_source 会扫整 thread,优先找真正外部信,
-        # 找不到就检查 Fwd: 标记 + 内文抽原客户
         source_label, real_external_email, real_external_from = determine_source(
             messages_meta, ""
         )
 
-        # 找最后一封「应该当作外部信」的 message:
-        #   外部:最后一封外部寄件者
-        #   转寄:最后一封(因为整 thread 都是 ibiney,但是 Fwd: 的)
-        #   内部:最后一封
+        # 解析每封信的日期,便于后面过滤
+        def _msg_date(m):
+            hd = {h["name"]: h["value"] for h in m.get("payload", {}).get("headers", [])}
+            try:
+                d = parsedate_to_datetime(hd.get("Date", ""))
+                if d.tzinfo is None:
+                    d = d.replace(tzinfo=timezone.utc)
+                return d
+            except Exception:
+                return None
+
+        # 找代表信:必须在 SEARCH_DAYS 窗口内
+        # 外部:窗口内最后一封外部信;转寄/内部:窗口内最后一封信
         last_target_idx = -1
-        if source_label == "🌍 外部":
-            for i in range(len(messages_meta) - 1, -1, -1):
+        for i in range(len(messages_meta) - 1, -1, -1):
+            mdate = _msg_date(messages_meta[i])
+            if not mdate or mdate < cutoff:
+                continue  # 这封超过 SEARCH_DAYS,跳过
+            if source_label == "🌍 外部":
                 hd = {h["name"]: h["value"] for h in messages_meta[i].get("payload", {}).get("headers", [])}
                 em = extract_email(hd.get("From", ""))
                 if em and not is_internal(em):
                     last_target_idx = i
                     break
-        else:
-            # 转寄 / 内部:取最后一封 (不论 ibiney.io)
-            last_target_idx = len(messages_meta) - 1
+            else:
+                last_target_idx = i
+                break
 
         if last_target_idx < 0:
+            # thread 在 SEARCH_DAYS 内没有合适的代表信,整 thread 跳过
             continue
 
         # B 逻辑:看「在 last_target 之后,当前 user 是否已回过」
@@ -2343,10 +2360,29 @@ def show_main_dashboard():
     user_name = user.get("name") or user_email
     user_first_name = user_name.split()[0] if user_name else "Me"
 
-    title_col, user_col = st.columns([4, 1])
+    # 搜寻范围(用户可调,session 内记忆)
+    if "search_days_setting" not in st.session_state:
+        st.session_state["search_days_setting"] = SEARCH_DAYS
+    current_days = st.session_state["search_days_setting"]
+
+    title_col, range_col, user_col = st.columns([3, 1, 1])
     with title_col:
         st.title("📧 BTL Email Monitor")
-        st.caption(f"已登入:{user_name} ({user_email}) / 显示你 Gmail 中过去 {SEARCH_DAYS} 天的待回客户信件")
+        st.caption(f"已登入:{user_name} ({user_email}) / 显示你 Gmail 中过去 {current_days} 天的待回客户信件")
+    with range_col:
+        st.write("")
+        new_days = st.selectbox(
+            "🗓️ 搜寻范围",
+            options=[1, 3, 5, 7, 14],
+            index=[1, 3, 5, 7, 14].index(current_days) if current_days in [1, 3, 5, 7, 14] else 1,
+            help="改变后会自动重新抓取 Gmail",
+        )
+        if new_days != current_days:
+            st.session_state["search_days_setting"] = new_days
+            st.session_state.pop("pending_items", None)
+            st.session_state.pop("summary_cache_for_table", None)
+            st.cache_data.clear()
+            st.rerun()
     with user_col:
         st.write("")
         if st.button("🔄 重新抓取", use_container_width=True):
@@ -2426,10 +2462,10 @@ def show_main_dashboard():
     render_excel_update_panel(user)
 
     if "pending_items" not in st.session_state:
-        with st.spinner("📬 正在从你的 Gmail 抓取待回信件(30-90 秒,只发生一次)..."):
+        with st.spinner(f"📬 正在从你的 Gmail 抓取过去 {current_days} 天待回信件(30-90 秒,只发生一次)..."):
             try:
                 st.session_state["pending_items"] = fetch_pending_emails(
-                    user["creds"], user_email
+                    user["creds"], user_email, search_days=current_days,
                 )
             except Exception as e:
                 st.error(f"抓取 Gmail 失败:{e}")
