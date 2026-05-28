@@ -553,10 +553,18 @@ def fetch_pending_emails(creds_dict, current_user_email, search_days=None):
     kw_clause = " OR ".join([f"subject:{k}" for k in BUSINESS_KEYWORDS])
     noise_clause = " ".join([f"-from:{d}" for d in NOISE_DOMAINS])
     query = f"in:inbox newer_than:{days}d ({kw_clause}) {noise_clause}"
+    # 翻页 — 长周末/旺季可能超过 200 个 thread,封顶 1000 防失控
     threads_resp = service.users().threads().list(
-        userId="me", q=query, maxResults=200
+        userId="me", q=query, maxResults=200,
     ).execute()
     threads = threads_resp.get("threads", [])
+    next_token = threads_resp.get("nextPageToken")
+    while next_token and len(threads) < 1000:
+        more = service.users().threads().list(
+            userId="me", q=query, maxResults=200, pageToken=next_token,
+        ).execute()
+        threads.extend(more.get("threads", []))
+        next_token = more.get("nextPageToken")
 
     items = []
     # "今天" 以香港时间为准 — UTC 午夜会让 HKT 08:00 之前的信被误标(或漏标)。
@@ -566,9 +574,14 @@ def fetch_pending_emails(creds_dict, current_user_email, search_days=None):
     cutoff = now - timedelta(days=days)
 
     for t in threads:
-        thread_full = service.users().threads().get(
-            userId="me", id=t["id"], format="full"
-        ).execute()
+        try:
+            thread_full = service.users().threads().get(
+                userId="me", id=t["id"], format="full"
+            ).execute()
+        except Exception as e:
+            # 单一 thread 失败(网络 / Gmail 5xx)不应该炸掉整批
+            print(f"[fetch_pending_emails] skipped thread {t.get('id')}: {e}")
+            continue
         messages_meta = thread_full.get("messages", [])
         if not messages_meta:
             continue
