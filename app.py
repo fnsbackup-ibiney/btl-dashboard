@@ -57,7 +57,7 @@ def to_local(dt):
 
 # 关键回信人:**只有这些人**回客户,thread 才算「已处理」
 # 其他同事(BTL FNS R / BTL FNS SKY 等)回的不算
-KEY_REPLIERS = ["david@ibiney.io", "ivy@ibiney.io"]
+KEY_REPLIERS = frozenset({"david@ibiney.io", "ivy@ibiney.io"})
 NOISE_DOMAINS = ["blot.new", "cloudhq.net", "bolt.eu"]
 INTERNAL_DOMAIN = "ibiney.io"
 SEARCH_DAYS = 3
@@ -250,7 +250,7 @@ def exchange_code_for_token(code):
         },
         # Phase 6 验证用:Google id_token,后续可以拿来换 Firebase ID token
         "id_token": token_data.get("id_token", ""),
-        "email": user_info.get("email", ""),
+        "email": user_info.get("email", "").lower(),
         "name": user_info.get("name", ""),
         "picture": user_info.get("picture", ""),
     }
@@ -332,7 +332,8 @@ def signature_says_key_replier(body):
         r"-{3,}\s*原始邮件",
         r"Begin forwarded message",
         r"Weitergeleitete Nachricht",
-        r"On .{1,80}wrote:",   # Gmail 引言区前的「On Mon, ... wrote:」
+        # Gmail 引言区:要求行首 + 年份(4位数字),避免内文「On Tuesday I wrote: …」误抓
+        r"\n\s*On .{5,200}\d{4}.{0,100}wrote:",
     ]
     end_idx = len(body)
     for marker in forward_markers:
@@ -1007,7 +1008,7 @@ def restore_session_from_url():
             "scopes": OAUTH_SCOPES,
         },
         "id_token": token_data.get("id_token", ""),
-        "email": user_info.get("email", email),
+        "email": user_info.get("email", email).lower(),
         "name": user_info.get("name", ""),
         "picture": user_info.get("picture", ""),
     }
@@ -3081,14 +3082,12 @@ def show_main_dashboard():
             st.session_state["search_days_setting"] = new_days
             st.session_state.pop("pending_items", None)
             st.session_state.pop("summary_cache_for_table", None)
-            st.cache_data.clear()
             st.rerun()
     with user_col:
         st.write("")
         if st.button("🔄 重新抓取", use_container_width=True):
             st.session_state.pop("pending_items", None)
             st.session_state.pop("summary_cache_for_table", None)
-            st.cache_data.clear()
             st.rerun()
         if st.button("🚪 登出", use_container_width=True):
             st.session_state.clear()
