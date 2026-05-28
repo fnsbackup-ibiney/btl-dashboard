@@ -155,8 +155,11 @@ def is_internal(email):
 
 
 def is_noise_domain(email):
-    lower = email.lower()
-    return any(d in lower for d in NOISE_DOMAINS)
+    # Match by domain suffix, not substring — "bolt.eu" must not catch "revolt.eu".
+    if not email or "@" not in email:
+        return False
+    domain = email.lower().rsplit("@", 1)[1]
+    return any(domain == d or domain.endswith("." + d) for d in NOISE_DOMAINS)
 
 
 def format_age(hours):
