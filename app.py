@@ -559,7 +559,8 @@ def fetch_pending_emails(creds_dict, current_user_email, search_days=None):
     threads = threads_resp.get("threads", [])
 
     items = []
-    today_start = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)
+    # "今天" 以香港时间为准 — UTC 午夜会让 HKT 08:00 之前的信被误标(或漏标)。
+    today_start = datetime.now(DISPLAY_TZ).replace(hour=0, minute=0, second=0, microsecond=0)
     now = datetime.now(timezone.utc)
     # 严格 days 窗口:thread 中只要有一封超过这个范围,就不当代表
     cutoff = now - timedelta(days=days)
