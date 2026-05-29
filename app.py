@@ -690,10 +690,11 @@ def fetch_pending_emails(creds_dict, current_user_email, search_days=None):
             if is_noise_domain(extract_email(last_msg["from"])):
                 continue
 
-        # 排除自动回覆 (out-of-office reply)
-        # 主旨开头有 "Automatische Antwort:" / "Auto Reply:" / "Automatic reply:" 等
-        subject_lower = (last_msg["subject"] or "").lower()
-        auto_reply_markers = [
+        # 排除自动回覆 (out-of-office reply) — 真正的 auto-reply 都在「主旨开头」(剥掉 Re:/Fwd: 后)。
+        # 用 substring 会误杀 "Re: parcel for our automatic reply system" 之类的正常信。
+        subject_lower = (last_msg["subject"] or "").lower().strip()
+        subject_stripped = re.sub(r"^(re|fwd|fw|aw|wg)\s*:\s*", "", subject_lower).strip()
+        auto_reply_starts = [
             "automatische antwort",  # 德文
             "automatic reply",       # 英文
             "auto reply",            # 英文短版
@@ -701,7 +702,7 @@ def fetch_pending_emails(creds_dict, current_user_email, search_days=None):
             "abwesenheit",           # 德文 absence
             "自动回覆", "自动回复",  # 中文
         ]
-        if any(m in subject_lower for m in auto_reply_markers):
+        if any(subject_stripped.startswith(m) for m in auto_reply_starts):
             continue
 
         # Demo 1 简单版:寄件者一律显示 Gmail 表面寄件者(不抽原客户)
@@ -1042,6 +1043,14 @@ def handle_oauth_callback():
             st.query_params.clear()
             st.query_params["_s"] = marker
         else:
+            # Google 没回 refresh_token(通常是同帐号之前 consent 过,Google 用 cache)。
+            # 这次会话能用,但浏览器一关 / 重整就要重登。提示用户去 revoke。
+            # 用 session_state 传递警告(因为 st.rerun 会洗掉直接 st.warning)
+            st.session_state["_post_login_warning"] = (
+                "⚠️ 这次登入没拿到 refresh_token,关掉页面就要重新登入。\n\n"
+                "**修法**:打开 https://myaccount.google.com/permissions → "
+                "找到 BTL Dashboard → 移除存取权 → 回来重新登入一次。"
+            )
             st.query_params.clear()
         st.rerun()
     except Exception as e:
@@ -3069,6 +3078,10 @@ def show_main_dashboard():
     user_email = user["email"]
     user_name = user.get("name") or user_email
     user_first_name = user_name.split()[0] if user_name else "Me"
+
+    # 登入流程残留的警告(例如 Google 没回 refresh_token)— 弹出后清掉避免下次再显示
+    if (warning_msg := st.session_state.pop("_post_login_warning", None)):
+        st.warning(warning_msg)
 
     # 搜寻范围(用户可调,session 内记忆)
     if "search_days_setting" not in st.session_state:
