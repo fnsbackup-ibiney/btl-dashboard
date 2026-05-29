@@ -987,6 +987,11 @@ def restore_session_from_url():
 
     token_data = _refresh_access_token(refresh_token)
     if not token_data:
+        # refresh_token 失效(被撤销 / 过期)— 清掉 URL marker,避免下次重整还卡在旧 token
+        try:
+            del st.query_params["_s"]
+        except Exception:
+            pass
         return False
 
     try:
@@ -996,6 +1001,10 @@ def restore_session_from_url():
             timeout=10,
         ).json()
     except Exception:
+        try:
+            del st.query_params["_s"]
+        except Exception:
+            pass
         return False
 
     st.session_state["user"] = {
@@ -3364,9 +3373,15 @@ def show_main_dashboard():
         view_df = view_df[view_df["客户"] == selected_client]
     if keyword:
         kw = keyword.lower()
+        # 也搜原始 Gmail subject — display「标题」栏可能被 AI 替成统一标题(例如 "SKY 80025"),
+        # 但用户记得的是 Gmail 原文(例如 "Re: trims confirmation")。
+        orig_subj = view_df["_item"].apply(
+            lambda x: (x.get("subject") or "") if isinstance(x, dict) else ""
+        )
         view_df = view_df[
             view_df["标题"].astype(str).str.lower().str.contains(kw, na=False)
             | view_df["寄件者"].astype(str).str.lower().str.contains(kw, na=False)
+            | orig_subj.astype(str).str.lower().str.contains(kw, na=False)
         ]
     view_df = view_df.reset_index(drop=True)
 
