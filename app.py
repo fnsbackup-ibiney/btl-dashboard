@@ -826,17 +826,40 @@ def gemini_reply_draft(msg_id, subject, thread_text, actions, sender_name, user_
 def precompute_summaries(items, progress_callback=None):
     """并行处理 AI 摘要,大幅加速大量信件场景。
 
+    三层 cache:
+      1. Firestore ai_summaries/{hash}  ← 跨 session / 跨用户 / 跨重启
+      2. @st.cache_data on gemini_summary_and_actions ← 同 process 24h
+      3. Gemini API ← 真正的 source of truth
+
     sequential 速度: ~1.5 秒/封 × 82 封 = 2 分钟
-    parallel (8 workers): ~15-20 秒搞定整批
+    parallel (8 workers): ~15-20 秒搞定整批,且 Firestore hit 直接跳过 Gemini
     """
     from concurrent.futures import ThreadPoolExecutor, as_completed
     out = {}
 
+    # 主线程先拿 Firebase token,因为 worker thread 不能安全存取 st.session_state
+    user = st.session_state.get("user")
+    firebase_token = get_firebase_id_token(user) if user else None
+
     def _process_one(it):
-        summary, actions = gemini_summary_and_actions(
-            it["msg_id"], it["subject"], it["thread_text"]
-        )
-        return it["msg_id"], summary, actions
+        msg_id = it["msg_id"]
+        subject = it["subject"]
+        thread_text = it["thread_text"]
+        hash_key = _ai_summary_hash(subject, thread_text)
+
+        # Layer 1: Firestore 查 — 命中就直接回,省 Gemini 一次
+        cached_summary, cached_actions = load_ai_summary_from_firestore(firebase_token, hash_key)
+        if cached_summary is not None:
+            return msg_id, cached_summary, cached_actions
+
+        # Layer 2 + 3: in-memory cache + Gemini fallback
+        summary, actions = gemini_summary_and_actions(msg_id, subject, thread_text)
+
+        # 成功的摘要写回 Firestore(失败的 "(摘要产生失败)" 不存,免得污染快取)
+        if summary and not summary.startswith("(摘要"):
+            save_ai_summary_to_firestore(firebase_token, hash_key, summary, actions, subject)
+
+        return msg_id, summary, actions
 
     completed = 0
     total = len(items)
@@ -1185,6 +1208,75 @@ def get_firebase_id_token(user):
         return firebase_token
     except Exception:
         return None
+
+
+def _ai_summary_hash(subject, thread_text):
+    """同 (subject, thread_text) → 同 hash → 同 Firestore doc。
+
+    Thread 新增信件后 thread_text 会变,hash 也变,自然失效旧 doc(留着无害)。
+    """
+    import hashlib
+    raw = (subject or "") + "\n###\n" + (thread_text or "")
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:32]
+
+
+def load_ai_summary_from_firestore(firebase_token, hash_key):
+    """从 Firestore 捞已快取的 AI 摘要。回传 (summary, actions) 或 (None, None) 表示 miss。
+
+    呼叫者必须先在主线程拿到 firebase_token(work threads 不能安全存取 session_state)。
+    """
+    if not firebase_token or not hash_key:
+        return None, None
+    project_id = "trims-f8e4a"
+    url = (
+        f"https://firestore.googleapis.com/v1/projects/{project_id}"
+        f"/databases/(default)/documents/ai_summaries/{hash_key}"
+    )
+    try:
+        resp = requests.get(
+            url, headers={"Authorization": f"Bearer {firebase_token}"}, timeout=5,
+        )
+        if not resp.ok:
+            return None, None
+        fields = resp.json().get("fields", {})
+        summary = fields.get("summary", {}).get("stringValue")
+        actions = fields.get("actions", {}).get("stringValue")
+        if summary is not None and actions is not None:
+            return summary, actions
+    except Exception:
+        pass
+    return None, None
+
+
+def save_ai_summary_to_firestore(firebase_token, hash_key, summary, actions, subject):
+    """把 AI 摘要写进 Firestore (ai_summaries/{hash})。Fire-and-forget — 不阻塞 dashboard。
+
+    多人同时撞到同一个 hash 时由 Firestore 自然 last-write-wins,不需 lock。
+    """
+    if not firebase_token or not hash_key:
+        return
+    project_id = "trims-f8e4a"
+    url = (
+        f"https://firestore.googleapis.com/v1/projects/{project_id}"
+        f"/databases/(default)/documents/ai_summaries/{hash_key}"
+        "?updateMask.fieldPaths=summary"
+        "&updateMask.fieldPaths=actions"
+        "&updateMask.fieldPaths=generated_at"
+        "&updateMask.fieldPaths=subject_preview"
+    )
+    body = {"fields": {
+        "summary": {"stringValue": summary or ""},
+        "actions": {"stringValue": actions or ""},
+        "generated_at": {"stringValue": datetime.now(timezone.utc).isoformat()},
+        "subject_preview": {"stringValue": (subject or "")[:100]},
+    }}
+    try:
+        requests.patch(
+            url, headers={"Authorization": f"Bearer {firebase_token}"},
+            json=body, timeout=5,
+        )
+    except Exception:
+        pass  # Firestore 慢 / 挂了不该影响 dashboard 渲染
 
 
 def save_edit_to_firestore(user, msg_id, title, summary, actions):
