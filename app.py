@@ -3171,7 +3171,25 @@ def show_main_dashboard():
     user_name = user.get("name") or user_email
     user_first_name = user_name.split()[0] if user_name else "Me"
 
-    # 登入流程残留的警告(例如 Google 没回 refresh_token)— 弹出后清掉避免下次再显示
+    # 持续性警告:Google 没发 refresh_token → 关页就要重登。每次 render 都显示,
+    # 直到用户去 Google 撤销旧授权后重登。一次性 _post_login_warning 已经被这块取代。
+    user_creds = (st.session_state.get("user") or {}).get("creds", {})
+    if not user_creds.get("refresh_token"):
+        st.error(
+            "⚠️ **这次登入没拿到 refresh_token — 关掉页面就要重新登入**\n\n"
+            "原因:Google 对曾经授权过的同帐号可能不发新 refresh_token。\n\n"
+            "**一次性修法(以后就不会再被困)**:\n"
+            "1. 点下面按钮打开 Google 权限页\n"
+            "2. 找到 **BTL Dashboard**(或其他 ibiney 内部 app)\n"
+            "3. 点 **Remove Access**\n"
+            "4. 回来重新登入 → 这次会拿到 refresh_token,之后 URL 会自己记住身份"
+        )
+        st.link_button(
+            "🔗 打开 Google 权限页",
+            "https://myaccount.google.com/permissions",
+        )
+
+    # 其他一次性登入警告(留着以备扩展)
     if (warning_msg := st.session_state.pop("_post_login_warning", None)):
         st.warning(warning_msg)
 
