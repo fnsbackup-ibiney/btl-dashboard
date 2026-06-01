@@ -758,13 +758,14 @@ def fetch_pending_emails(creds_dict, current_user_email, search_days=None):
 
 @st.cache_data(ttl=86400, show_spinner=False)
 def gemini_summary_and_actions(msg_id, subject, thread_text):
-    """根据完整 thread(而不只是最后一封)产出摘要 + 待办。
+    """根据完整 thread 产出摘要 + 待办 + Excel 提醒。
 
     cache key 包含 thread_text → 若 thread 多了一封新信,自动 re-summarize。
+    回传 (summary, actions, excel_reminder_dict_or_None)
     """
     prompt = (
         "You are analyzing an email THREAD (full conversation history below). "
-        "Produce TWO sections in English based on the WHOLE thread context, "
+        "Produce THREE sections in English based on the WHOLE thread context, "
         "but with the focus on what the LATEST external message asks for. "
         "Use EXACTLY this format with [---] as separator (no extra text outside):\n\n"
         "**Theme:** [a short clean title MAX 8 words, format: 'OrderNumber MainTopic']\n"
@@ -779,6 +780,19 @@ def gemini_summary_and_actions(msg_id, subject, thread_text):
         "**📅 Deadline:** [extract date from anywhere in thread, or \"Not specified\"]\n"
         "**👤 Awaiting your reply:** [the person waiting]\n"
         "**📌 Context:** [one line including key history from earlier messages]\n\n"
+        "[---]\n\n"
+        "**ExcelReminder:**\n"
+        "Analyze whether the LATEST customer message contains a confirmation, change, "
+        "or comment that would require updating the master Excel order tracking sheet "
+        "(e.g. price confirmed, color ratio changed, delivery date pushed, quantity adjusted, "
+        "PI revision requested, spec change accepted).\n"
+        "Output JSON only, ONE of:\n"
+        '  {"needs_update":"yes","client":"<short customer name>","style":"<order/style number>",'
+        '"title":"<3-7 word change summary>","confidence":"high|medium",'
+        '"quote":"<exact customer quote, max 200 chars>"}\n'
+        '  {"needs_update":"no"}\n'
+        "confidence=high when the change is explicit (numbers, dates, definite verbs). "
+        "confidence=medium when comment is suggestive but ambiguous.\n\n"
         f"Email Subject: {subject}\n\n"
         f"=== Email Thread ===\n{thread_text}\n=== End of Thread ==="
     )
@@ -787,21 +801,59 @@ def gemini_summary_and_actions(msg_id, subject, thread_text):
         json={
             "contents": [{"parts": [{"text": prompt}]}],
             "generationConfig": {
-                "temperature": 0.3, "maxOutputTokens": 1500,
+                "temperature": 0.3, "maxOutputTokens": 1800,
                 "thinkingConfig": {"thinkingBudget": 0},
             },
         },
         timeout=60,
     )
     if not resp.ok:
-        return "(摘要产生失败)", ""
+        return "(摘要产生失败)", "", None
     try:
         parts = resp.json()["candidates"][0]["content"]["parts"]
         full_text = "".join(p.get("text", "") for p in parts).strip()
         sections = full_text.split("[---]")
-        return sections[0].strip(), (sections[1].strip() if len(sections) > 1 else "")
+        summary = sections[0].strip() if len(sections) > 0 else ""
+        actions = sections[1].strip() if len(sections) > 1 else ""
+        excel_reminder = _parse_excel_reminder_section(
+            sections[2] if len(sections) > 2 else ""
+        )
+        return summary, actions, excel_reminder
     except (KeyError, IndexError):
-        return "(摘要产生失败)", ""
+        return "(摘要产生失败)", "", None
+
+
+def _parse_excel_reminder_section(text):
+    """从 Gemini 第 3 段拆出 reminder dict 或 None。
+    容错:Gemini 可能包了 ```json ... ``` 或加前缀,只抓 { ... } 段。
+    """
+    if not text:
+        return None
+    import json as _json
+    # 抓第一个 { 到最后一个 } 之间的内容
+    start = text.find("{")
+    end = text.rfind("}")
+    if start < 0 or end < 0 or end <= start:
+        return None
+    try:
+        data = _json.loads(text[start: end + 1])
+    except Exception:
+        return None
+    if not isinstance(data, dict):
+        return None
+    if data.get("needs_update", "").lower() != "yes":
+        return None
+    # 必要栏位:client / style / title / quote
+    required = ["client", "style", "title", "quote"]
+    if not all(data.get(k) for k in required):
+        return None
+    return {
+        "client": str(data["client"])[:60],
+        "style": str(data["style"])[:60],
+        "title": str(data["title"])[:80],
+        "confidence": data.get("confidence", "medium") if data.get("confidence") in ("high", "medium") else "medium",
+        "quote": str(data["quote"])[:300],
+    }
 
 
 def gemini_reply_draft(msg_id, subject, thread_text, actions, sender_name, user_first_name):
@@ -866,18 +918,25 @@ def precompute_summaries(items, progress_callback=None):
         hash_key = _ai_summary_hash(subject, thread_text)
 
         # Layer 1: Firestore 查 — 命中就直接回,省 Gemini 一次
-        cached_summary, cached_actions = load_ai_summary_from_firestore(firebase_token, hash_key)
+        cached_summary, cached_actions, cached_excel = load_ai_summary_from_firestore(
+            firebase_token, hash_key,
+        )
         if cached_summary is not None:
-            return msg_id, cached_summary, cached_actions
+            return msg_id, cached_summary, cached_actions, cached_excel
 
         # Layer 2 + 3: in-memory cache + Gemini fallback
-        summary, actions = gemini_summary_and_actions(msg_id, subject, thread_text)
+        summary, actions, excel_reminder = gemini_summary_and_actions(
+            msg_id, subject, thread_text,
+        )
 
         # 成功的摘要写回 Firestore(失败的 "(摘要产生失败)" 不存,免得污染快取)
         if summary and not summary.startswith("(摘要"):
-            save_ai_summary_to_firestore(firebase_token, hash_key, summary, actions, subject)
+            save_ai_summary_to_firestore(
+                firebase_token, hash_key, summary, actions, subject,
+                excel_reminder=excel_reminder,
+            )
 
-        return msg_id, summary, actions
+        return msg_id, summary, actions, excel_reminder
 
     completed = 0
     total = len(items)
@@ -886,11 +945,12 @@ def precompute_summaries(items, progress_callback=None):
         futures = {executor.submit(_process_one, it): it for it in items}
         for fut in as_completed(futures):
             try:
-                msg_id, summary, actions = fut.result()
+                msg_id, summary, actions, excel_reminder = fut.result()
                 out[msg_id] = {
                     "summary": summary,
                     "actions": actions,
                     "theme": extract_theme(summary),
+                    "excel_reminder": excel_reminder,  # dict or None
                 }
             except Exception:
                 pass
@@ -1239,12 +1299,15 @@ def _ai_summary_hash(subject, thread_text):
 
 
 def load_ai_summary_from_firestore(firebase_token, hash_key):
-    """从 Firestore 捞已快取的 AI 摘要。回传 (summary, actions) 或 (None, None) 表示 miss。
+    """从 Firestore 捞已快取的 AI 摘要 + Excel reminder。
 
-    呼叫者必须先在主线程拿到 firebase_token(work threads 不能安全存取 session_state)。
+    回传 (summary, actions, excel_reminder_dict_or_None) 或 (None, None, None) 表示 miss。
+    若 excel_check 栏位完全不存在(旧版 doc) → 视为 miss,强迫重叫 Gemini 补齐。
+
+    呼叫者必须先在主线程拿到 firebase_token(worker threads 不能安全存取 session_state)。
     """
     if not firebase_token or not hash_key:
-        return None, None
+        return None, None, None
     project_id = "trims-f8e4a"
     url = (
         f"https://firestore.googleapis.com/v1/projects/{project_id}"
@@ -1255,21 +1318,34 @@ def load_ai_summary_from_firestore(firebase_token, hash_key):
             url, headers={"Authorization": f"Bearer {firebase_token}"}, timeout=5,
         )
         if not resp.ok:
-            return None, None
+            return None, None, None
         fields = resp.json().get("fields", {})
         summary = fields.get("summary", {}).get("stringValue")
         actions = fields.get("actions", {}).get("stringValue")
-        if summary is not None and actions is not None:
-            return summary, actions
+        excel_check = fields.get("excel_check", {}).get("stringValue")
+        # excel_check absent → 旧 doc,重叫 Gemini 补齐;present 但 empty/"none" → 不需提醒
+        if summary is None or actions is None or excel_check is None:
+            return None, None, None
+        excel_reminder = None
+        if excel_check and excel_check.lower() != "none":
+            import json as _json
+            try:
+                excel_reminder = _json.loads(excel_check)
+                if not isinstance(excel_reminder, dict):
+                    excel_reminder = None
+            except Exception:
+                excel_reminder = None
+        return summary, actions, excel_reminder
     except Exception:
         pass
-    return None, None
+    return None, None, None
 
 
-def save_ai_summary_to_firestore(firebase_token, hash_key, summary, actions, subject):
-    """把 AI 摘要写进 Firestore (ai_summaries/{hash})。Fire-and-forget — 不阻塞 dashboard。
+def save_ai_summary_to_firestore(firebase_token, hash_key, summary, actions, subject, excel_reminder=None):
+    """把 AI 摘要 + Excel reminder 写进 Firestore (ai_summaries/{hash})。Fire-and-forget。
 
     多人同时撞到同一个 hash 时由 Firestore 自然 last-write-wins,不需 lock。
+    excel_reminder: dict {client,style,title,confidence,quote} 或 None(代表「检查过,不需提醒」)
     """
     if not firebase_token or not hash_key:
         return
@@ -1281,12 +1357,19 @@ def save_ai_summary_to_firestore(firebase_token, hash_key, summary, actions, sub
         "&updateMask.fieldPaths=actions"
         "&updateMask.fieldPaths=generated_at"
         "&updateMask.fieldPaths=subject_preview"
+        "&updateMask.fieldPaths=excel_check"
     )
+    if excel_reminder:
+        import json as _json
+        excel_check_value = _json.dumps(excel_reminder, ensure_ascii=False)
+    else:
+        excel_check_value = "none"
     body = {"fields": {
         "summary": {"stringValue": summary or ""},
         "actions": {"stringValue": actions or ""},
         "generated_at": {"stringValue": datetime.now(timezone.utc).isoformat()},
         "subject_preview": {"stringValue": (subject or "")[:100]},
+        "excel_check": {"stringValue": excel_check_value},
     }}
     try:
         requests.patch(
@@ -2144,13 +2227,42 @@ def set_reminder_state(user, msg_id, state):
     # TODO Phase 2:同步写进 Firestore reminders/{msg_id}
 
 
+def build_reminders_from_cache(items, summary_cache):
+    """从 items + summary_cache 萃取真实 Excel reminders。
+
+    summary_cache[msg_id]["excel_reminder"] 来自 Gemini 第 3 段的判断,
+    dict = 需提醒,None = 检查过不需提醒。
+    """
+    out = []
+    for it in items:
+        sm = summary_cache.get(it["msg_id"], {})
+        er = sm.get("excel_reminder")
+        if not er or not isinstance(er, dict):
+            continue
+        out.append({
+            "msg_id": it["msg_id"],
+            "client": er.get("client", "(unknown)"),
+            "style": er.get("style", "(unknown)"),
+            "title": er.get("title", "Change requested"),
+            "confidence": er.get("confidence", "medium") if er.get("confidence") in ("high", "medium") else "medium",
+            "email_subject": it.get("subject", ""),
+            "email_date": to_local(it["date"]).strftime("%Y-%m-%d %H:%M") if it.get("date") else "",
+            "from": it.get("from", ""),
+            "quote": er.get("quote", ""),
+            "gmail_link": f"https://mail.google.com/mail/u/0/#inbox/{it['msg_id']}",
+        })
+    return out
+
+
 def render_excel_update_panel(user, reminders=None):
     """顶部面板 — 显示「需要更新大货表」的提醒清单。
 
     系统绝不直接改 Excel,只负责提醒人工去更新。
+    reminders=None → 没传(不该发生),返回 demo 数据避免界面消失。
+    reminders=[]   → 真实「无提醒」,不显示面板。
     """
     if reminders is None:
-        reminders = SAMPLE_EXCEL_REMINDERS  # Phase 1 demo data
+        reminders = SAMPLE_EXCEL_REMINDERS  # 仅在首次/异常路径走到这里时降级用
 
     # 过滤掉已标记 updated 或 dismissed 的
     pending = [r for r in reminders
@@ -3367,9 +3479,6 @@ def show_main_dashboard():
             st.rerun()
         st.divider()
 
-    # 大货表 Excel 更新提醒(Phase 1:demo 资料,Phase 2 接 AI)
-    render_excel_update_panel(user)
-
     if "pending_items" not in st.session_state:
         with st.spinner(f"📬 正在从你的 Gmail 抓取过去 {current_days} 天待回信件(30-90 秒,只发生一次)..."):
             try:
@@ -3415,6 +3524,10 @@ def show_main_dashboard():
         )
         progress_bar.empty()
     summary_cache = st.session_state["summary_cache_for_table"]
+
+    # 大货表 Excel 更新提醒(Phase 2:AI 真实判断,从 summary_cache 拿)
+    excel_reminders = build_reminders_from_cache(items, summary_cache)
+    render_excel_update_panel(user, reminders=excel_reminders)
 
     # 分组计算每封信的最终显示标题
     grouped_titles, topic_keys, key_counts = compute_grouped_titles(items, summary_cache)
