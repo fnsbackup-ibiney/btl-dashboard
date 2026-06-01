@@ -546,6 +546,44 @@ def build_thread_transcript(messages_meta):
     return transcript
 
 
+def _fetch_threads_full_parallel(creds_dict, threads, max_workers=6):
+    """平行抓所有 thread 的完整内容。回传 [(t, thread_full_or_None), ...] 按输入顺序。
+
+    Gmail API client 不是 thread-safe → 每个 worker 用 threading.local 各自建一个 service。
+    cache_discovery=False + 进程内 discovery 文件已经被 googleapiclient 自动 cache,
+    所以第二个 build() 之后基本免费。
+
+    sequential 速度: ~200ms × N thread = 80 thread 要 16 秒
+    parallel (6 workers): 80 thread 约 3 秒
+    """
+    from concurrent.futures import ThreadPoolExecutor
+    import threading as _threading
+
+    local = _threading.local()
+
+    def _get_svc():
+        if not hasattr(local, "svc"):
+            local.svc = build(
+                "gmail", "v1",
+                credentials=credentials_from_dict(creds_dict),
+                cache_discovery=False,
+            )
+        return local.svc
+
+    def _fetch_one(t):
+        try:
+            full = _get_svc().users().threads().get(
+                userId="me", id=t["id"], format="full",
+            ).execute()
+            return t, full
+        except Exception as e:
+            print(f"[fetch_threads_full] skipped {t.get('id')}: {e}")
+            return t, None
+
+    with ThreadPoolExecutor(max_workers=max_workers) as pool:
+        return list(pool.map(_fetch_one, threads))
+
+
 def fetch_pending_emails(creds_dict, current_user_email, search_days=None):
     days = search_days or SEARCH_DAYS
     creds = credentials_from_dict(creds_dict)
@@ -574,15 +612,13 @@ def fetch_pending_emails(creds_dict, current_user_email, search_days=None):
     # 严格 days 窗口:thread 中只要有一封超过这个范围,就不当代表
     cutoff = now - timedelta(days=days)
 
-    for t in threads:
-        try:
-            thread_full = service.users().threads().get(
-                userId="me", id=t["id"], format="full"
-            ).execute()
-        except Exception as e:
-            # 单一 thread 失败(网络 / Gmail 5xx)不应该炸掉整批
-            print(f"[fetch_pending_emails] skipped thread {t.get('id')}: {e}")
-            continue
+    # Phase 1: 平行抓所有 thread 的完整内容(原本逐个 .get() 80 个就 16 秒)
+    fetched = _fetch_threads_full_parallel(creds_dict, threads)
+
+    # Phase 2: 串行处理每个 thread(纯 CPU 工作,平行化没意义且会复杂化共用状态)
+    for t, thread_full in fetched:
+        if thread_full is None:
+            continue  # 单一 thread 抓失败 — 已在 _fetch_threads_full_parallel log 过
         messages_meta = thread_full.get("messages", [])
         if not messages_meta:
             continue
