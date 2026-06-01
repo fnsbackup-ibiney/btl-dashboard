@@ -601,7 +601,16 @@ def fetch_pending_emails(creds_dict, current_user_email, search_days=None):
                     d = d.replace(tzinfo=timezone.utc)
                 return d
             except Exception:
-                return None
+                pass
+            # Fallback: Gmail 的 internalDate(epoch ms)永远存在且不会被 client 端弄坏。
+            # Date header 偶尔会因为寄件方 mailer bug 解析失败 — 避免静默丢信。
+            internal = m.get("internalDate")
+            if internal:
+                try:
+                    return datetime.fromtimestamp(int(internal) / 1000, tz=timezone.utc)
+                except Exception:
+                    pass
+            return None
 
         # 找代表信:必须在 SEARCH_DAYS 窗口内
         # 外部:窗口内最后一封外部信;转寄/内部:窗口内最后一封信
@@ -620,8 +629,17 @@ def fetch_pending_emails(creds_dict, current_user_email, search_days=None):
                 last_target_idx = i
                 break
 
+        # Fallback: 外部 thread 窗口内没找到外部信(客户老信,但内部最近在讨论)→
+        # 退而求其次用窗口内最后一封任何信当代表,避免「内部还在处理但 dashboard 不见」
+        if last_target_idx < 0 and source_label == "🌍 外部":
+            for i in range(len(messages_meta) - 1, -1, -1):
+                mdate = _msg_date(messages_meta[i])
+                if mdate and mdate >= cutoff:
+                    last_target_idx = i
+                    break
+
         if last_target_idx < 0:
-            # thread 在 SEARCH_DAYS 内没有合适的代表信,整 thread 跳过
+            # thread 在 SEARCH_DAYS 内完全没活动,整 thread 跳过
             continue
 
         # B 逻辑:**只有 David 或 Ivy** 回了之后才算「已处理」
