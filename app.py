@@ -3331,6 +3331,24 @@ def render_read_unread_debug(user):
     )
 
 
+@st.fragment(run_every=60)
+def _autorefresh_tick(interval_seconds):
+    """每分钟跑一次的小 fragment(不会重 render 整页),
+    检查距离上次抓取是否超过设定的 interval。超过 → 清 cache + 全 app rerun。
+
+    interval_seconds=0 → disabled,直接 return。
+    """
+    if not interval_seconds:
+        return
+    now_ts = datetime.now(timezone.utc).timestamp()
+    last_fetch = st.session_state.get("_last_fetch_ts", 0)
+    if now_ts - last_fetch >= interval_seconds:
+        st.session_state["_last_fetch_ts"] = now_ts
+        st.session_state.pop("pending_items", None)
+        st.session_state.pop("summary_cache_for_table", None)
+        st.rerun(scope="app")
+
+
 def show_main_dashboard():
     user = st.session_state["user"]
     user_email = user["email"]
@@ -3380,12 +3398,14 @@ def show_main_dashboard():
             st.session_state["search_days_setting"] = new_days
             st.session_state.pop("pending_items", None)
             st.session_state.pop("summary_cache_for_table", None)
+            st.session_state.pop("_last_fetch_ts", None)
             st.rerun()
     with user_col:
         st.write("")
         if st.button("🔄 重新抓取", use_container_width=True):
             st.session_state.pop("pending_items", None)
             st.session_state.pop("summary_cache_for_table", None)
+            st.session_state.pop("_last_fetch_ts", None)
             st.rerun()
         if st.button("🚪 登出", use_container_width=True):
             st.session_state.clear()
@@ -3458,6 +3478,31 @@ def show_main_dashboard():
             _toggle_dev_panel("_attachment_analysis", also_pop=["_attachment_stats"])
             st.rerun()
 
+    # ── 自动 refresh(独立 expander,跟 dev 工具分开)
+    with st.sidebar.expander("🔁 自动 refresh", expanded=False):
+        interval_label = st.selectbox(
+            "间隔",
+            ["关闭", "每 30 分钟", "每 1 小时"],
+            index=0,
+            key="_autorefresh_setting",
+            help="开着 dashboard 不动也会自动抓最新 Gmail。Firestore cache 让重抓基本免费",
+        )
+        interval_map = {"关闭": 0, "每 30 分钟": 1800, "每 1 小时": 3600}
+        autorefresh_interval = interval_map.get(interval_label, 0)
+
+        last_fetch_ts = st.session_state.get("_last_fetch_ts")
+        if last_fetch_ts:
+            last_dt = datetime.fromtimestamp(last_fetch_ts, tz=timezone.utc).astimezone(DISPLAY_TZ)
+            st.caption(f"⏰ 上次抓取: {last_dt.strftime('%H:%M:%S')}")
+        else:
+            st.caption("⏰ 上次抓取: (尚未发生)")
+
+        if autorefresh_interval > 0:
+            next_in = max(0, autorefresh_interval - int(datetime.now(timezone.utc).timestamp() - (last_fetch_ts or 0)))
+            mins, secs = divmod(next_in, 60)
+            st.caption(f"⏳ 下次自动抓取大约: {mins} 分 {secs} 秒后")
+            _autorefresh_tick(autorefresh_interval)
+
     if st.session_state.get("_thread_inspector"):
         render_thread_inspector(user)
         st.divider()
@@ -3521,6 +3566,7 @@ def show_main_dashboard():
                 st.session_state["pending_items"] = fetch_pending_emails(
                     user["creds"], user_email, search_days=current_days,
                 )
+                st.session_state["_last_fetch_ts"] = datetime.now(timezone.utc).timestamp()
             except Exception as e:
                 st.error(f"抓取 Gmail 失败:{e}")
                 st.info("可能是 token 过期,请登出重新登入。")
