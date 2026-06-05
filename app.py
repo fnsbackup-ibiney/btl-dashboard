@@ -546,6 +546,18 @@ def build_thread_transcript(messages_meta):
     return transcript
 
 
+def make_gmail_link(msg_id):
+    """Build Gmail URL that opens the message in the CORRECT account.
+
+    Browser users often have multiple Google accounts logged in. `u/0` always
+    opens the browser's first account — which may not be the dashboard's user.
+    Using `u/{email}` makes Gmail switch to that account before opening.
+    """
+    user_email = (st.session_state.get("user") or {}).get("email", "")
+    account_part = urllib.parse.quote(user_email) if user_email else "0"
+    return f"https://mail.google.com/mail/u/{account_part}/#inbox/{msg_id}"
+
+
 def _fetch_threads_full_parallel(creds_dict, threads, max_workers=6):
     """平行抓所有 thread 的完整内容。回传 [(t, thread_full_or_None), ...] 按输入顺序。
 
@@ -1260,7 +1272,7 @@ def render_email_detail(item, user_name, user_first_name, summary_cache, display
             "body", value=body, height=520, disabled=True, label_visibility="collapsed",
         )
 
-    gmail_link = f"https://mail.google.com/mail/u/0/#inbox/{msg_id}"
+    gmail_link = make_gmail_link(msg_id)
     st.markdown(f"[🔗 在 Gmail 中开启原信]({gmail_link})")
 
     st.divider()
@@ -2285,7 +2297,7 @@ def build_reminders_from_cache(items, summary_cache):
             "email_date": to_local(it["date"]).strftime("%Y-%m-%d %H:%M") if it.get("date") else "",
             "from": it.get("from", ""),
             "quote": er.get("quote", ""),
-            "gmail_link": f"https://mail.google.com/mail/u/0/#inbox/{it['msg_id']}",
+            "gmail_link": make_gmail_link(it["msg_id"]),
         })
     return out
 
@@ -3632,7 +3644,7 @@ def show_main_dashboard():
             "标题": grouped_titles[it["msg_id"]],
             "收信日期": to_local(it["date"]).strftime("%Y-%m-%d %H:%M"),
             "等待时长": format_age(it["age_hours"]),
-            "邮件连结": f"https://mail.google.com/mail/u/0/#inbox/{it['msg_id']}",
+            "邮件连结": make_gmail_link(it["msg_id"]),
             "_body": it["body"],
             "_item": it,
         })
