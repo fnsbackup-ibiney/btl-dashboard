@@ -281,12 +281,23 @@ def parse_gmail_message(service, msg_id):
     subject = headers.get("Subject", "")
     from_raw = headers.get("From", "")
     date_str = headers.get("Date", "")
+    msg_date = None
     try:
         msg_date = parsedate_to_datetime(date_str)
         if msg_date.tzinfo is None:
             msg_date = msg_date.replace(tzinfo=timezone.utc)
     except Exception:
-        msg_date = datetime.now(timezone.utc)
+        pass
+    if msg_date is None:
+        # Mirror _msg_date 的 internalDate fallback — 避免代表信「等待时长 = 0h」
+        internal = msg.get("internalDate")
+        if internal:
+            try:
+                msg_date = datetime.fromtimestamp(int(internal) / 1000, tz=timezone.utc)
+            except Exception:
+                pass
+    if msg_date is None:
+        msg_date = datetime.now(timezone.utc)  # 最后手段
     body = extract_plain_body(msg.get("payload", {}))
     is_unread = "UNREAD" in msg.get("labelIds", [])
     return {
@@ -686,11 +697,13 @@ def fetch_pending_emails(creds_dict, current_user_email, search_days=None):
 
         # Fallback: 外部 thread 窗口内没找到外部信(客户老信,但内部最近在讨论)→
         # 退而求其次用窗口内最后一封任何信当代表,避免「内部还在处理但 dashboard 不见」
+        used_internal_fallback = False
         if last_target_idx < 0 and source_label == "🌍 外部":
             for i in range(len(messages_meta) - 1, -1, -1):
                 mdate = _msg_date(messages_meta[i])
                 if mdate and mdate >= cutoff:
                     last_target_idx = i
+                    used_internal_fallback = True
                     break
 
         if last_target_idx < 0:
@@ -780,8 +793,14 @@ def fetch_pending_emails(creds_dict, current_user_email, search_days=None):
 
         # Demo 1 简单版:寄件者一律显示 Gmail 表面寄件者(不抽原客户)
         # 来源资讯靠左侧「来源」栏 emoji 区分:🌍 外部 / 📨 转寄 / 🏢 内部
-        display_from = last_msg["from"]
-        display_email = extract_email(last_msg["from"])
+        # 例外:外部 thread 用内部信 fallback 当代表时,寄件者要显示原客户,
+        # 否则用户会看到「🌍 外部」标签但寄件者却是同事 → 误导
+        if used_internal_fallback and real_external_from:
+            display_from = real_external_from
+            display_email = real_external_email
+        else:
+            display_from = last_msg["from"]
+            display_email = extract_email(last_msg["from"])
 
         is_today = last_msg["date"] >= today_start
         age_hours = int((now - last_msg["date"]).total_seconds() // 3600)
@@ -890,10 +909,32 @@ def _parse_excel_reminder_section(text):
     end = text.rfind("}")
     if start < 0 or end < 0 or end <= start:
         return None
+    candidate = text[start: end + 1]
     try:
-        data = _json.loads(text[start: end + 1])
+        data = _json.loads(candidate)
     except Exception:
-        return None
+        # Gemini 偶发输出 trailing comma 或 string 内真实换行 → strict json 会炸
+        # Pass 1: 干掉 trailing commas before } or ]
+        cleaned = re.sub(r",(\s*[}\]])", r"\1", candidate)
+        # Pass 2: 把 string 内未转义的 \n / \r 换成 \\n / \\r(简易状态机)
+        out, in_str, esc = [], False, False
+        for ch in cleaned:
+            if esc:
+                out.append(ch); esc = False; continue
+            if ch == "\\":
+                out.append(ch); esc = True; continue
+            if ch == '"':
+                in_str = not in_str; out.append(ch); continue
+            if in_str and ch == "\n":
+                out.append("\\n"); continue
+            if in_str and ch == "\r":
+                out.append("\\r"); continue
+            out.append(ch)
+        cleaned2 = "".join(out)
+        try:
+            data = _json.loads(cleaned2)
+        except Exception:
+            return None
     if not isinstance(data, dict):
         return None
     if data.get("needs_update", "").lower() != "yes":
@@ -1199,14 +1240,9 @@ def handle_oauth_callback():
             st.query_params.clear()
             st.query_params["_s"] = marker
         else:
-            # Google 没回 refresh_token(通常是同帐号之前 consent 过,Google 用 cache)。
-            # 这次会话能用,但浏览器一关 / 重整就要重登。提示用户去 revoke。
-            # 用 session_state 传递警告(因为 st.rerun 会洗掉直接 st.warning)
-            st.session_state["_post_login_warning"] = (
-                "⚠️ 这次登入没拿到 refresh_token,关掉页面就要重新登入。\n\n"
-                "**修法**:打开 https://myaccount.google.com/permissions → "
-                "找到 BTL Dashboard → 移除存取权 → 回来重新登入一次。"
-            )
+            # Google 没回 refresh_token(同帐号之前 consent 过,Google 用 cache)。
+            # 警告已经在 show_main_dashboard 用 persistent st.error 处理 — 这里不再
+            # 重复设 _post_login_warning,免得第一次登入看到红 error + 黄 warning 两个叠。
             st.query_params.clear()
         st.rerun()
     except Exception as e:
