@@ -549,13 +549,20 @@ def build_thread_transcript(messages_meta):
 def make_gmail_link(msg_id):
     """Build Gmail URL that opens the message in the CORRECT account.
 
-    Browser users often have multiple Google accounts logged in. `u/0` always
-    opens the browser's first account — which may not be the dashboard's user.
-    Using `u/{email}` makes Gmail switch to that account before opening.
+    Uses `?authuser={email}` rather than `u/{email}`. The `u/{email}` form
+    requires that account to already be in the browser session — if not,
+    Gmail shows "Temporary Error 404" which is confusing. `?authuser=` is
+    more lenient: when the account isn't in browser, Gmail shows its account
+    chooser (with the target email pre-filled) instead of an error page.
     """
     user_email = (st.session_state.get("user") or {}).get("email", "")
-    account_part = urllib.parse.quote(user_email) if user_email else "0"
-    return f"https://mail.google.com/mail/u/{account_part}/#inbox/{msg_id}"
+    if user_email:
+        return (
+            f"https://mail.google.com/mail/"
+            f"?authuser={urllib.parse.quote(user_email)}"
+            f"#inbox/{msg_id}"
+        )
+    return f"https://mail.google.com/mail/u/0/#inbox/{msg_id}"
 
 
 def _fetch_threads_full_parallel(creds_dict, threads, max_workers=6):
