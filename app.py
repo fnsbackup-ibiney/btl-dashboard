@@ -482,6 +482,24 @@ def extract_forwarded_sender(body):
     return None
 
 
+def thread_has_key_person(messages_meta):
+    """Check if David or Ivy appears anywhere in the thread (From / To / Cc of any message).
+
+    用在 🏢 内部 thread 判断:同事们自己内部讨论、David/Ivy 完全无关 → 不该显示在 dashboard。
+    To / Cc 可能有多个 email 用逗号分隔,需要全部 scan。
+    """
+    for m in messages_meta:
+        hd = {h["name"]: h["value"] for h in m.get("payload", {}).get("headers", [])}
+        for field in ("From", "To", "Cc"):
+            field_val = hd.get(field, "").lower()
+            if not field_val:
+                continue
+            for em in re.findall(r"[\w.+\-]+@[\w.\-]+", field_val):
+                if em in KEY_REPLIERS:
+                    return True
+    return False
+
+
 def determine_source(messages_meta, top_level_from):
     """判断这个 thread 的「来源」分类。
 
@@ -657,6 +675,11 @@ def fetch_pending_emails(creds_dict, current_user_email, search_days=None):
         source_label, real_external_email, real_external_from = determine_source(
             messages_meta, ""
         )
+
+        # 🏢 内部 thread 必须至少有 David/Ivy 在 thread 里(From/To/Cc 任一栏)才显示。
+        # 同事自己发起的纯内部讨论(David/Ivy 完全无关)→ 不属于 dashboard 监控范围,跳过。
+        if source_label == "🏢 内部" and not thread_has_key_person(messages_meta):
+            continue
 
         # 解析每封信的日期,便于后面过滤
         def _msg_date(m):
