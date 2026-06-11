@@ -795,9 +795,14 @@ def fetch_pending_emails(creds_dict, current_user_email, search_days=None):
         # 来源资讯靠左侧「来源」栏 emoji 区分:🌍 外部 / 📨 转寄 / 🏢 内部
         # 例外:外部 thread 用内部信 fallback 当代表时,寄件者要显示原客户,
         # 否则用户会看到「🌍 外部」标签但寄件者却是同事 → 误导
-        if used_internal_fallback and real_external_from:
-            display_from = real_external_from
-            display_email = real_external_email
+        if used_internal_fallback:
+            if real_external_from:
+                display_from = real_external_from
+                display_email = real_external_email
+            else:
+                # 外部 thread 但 From header 解不出 → 标显「未识别」,不假冒成同事
+                display_from = "(外部客户未识别)"
+                display_email = ""
         else:
             display_from = last_msg["from"]
             display_email = extract_email(last_msg["from"])
@@ -1261,9 +1266,12 @@ def render_email_detail(item, user_name, user_first_name, summary_cache, display
     actions = cached.get("actions", "")
 
     saved = st.session_state.get(f"_saved_{msg_id}", {})
-    final_title = saved.get("title") or display_title
-    display_summary = saved.get("summary") or summary
-    display_actions = saved.get("actions") or actions
+    # 用 .get(key, default) — 区分「用户没存过」vs「用户故意存空字串」。
+    # 旧版用 `... or ...` 会把空字串当 falsy 而 fallback 回 AI 版,
+    # 用户清空了等于白做。
+    final_title = saved.get("title", display_title)
+    display_summary = saved.get("summary", summary)
+    display_actions = saved.get("actions", actions)
 
     st.divider()
     st.markdown(f"### 📄 {final_title}")
@@ -1355,28 +1363,52 @@ def get_firebase_id_token(user):
         return cached
 
     api_key = st.secrets.get("FIREBASE_WEB_API_KEY", "")
-    google_id_token = user.get("id_token", "")
-    if not api_key or not google_id_token:
+    if not api_key:
         return None
 
-    try:
-        resp = requests.post(
-            f"https://identitytoolkit.googleapis.com/v1/accounts:signInWithIdp?key={api_key}",
-            json={
-                "postBody": f"id_token={google_id_token}&providerId=google.com",
-                "requestUri": REDIRECT_URI,
-                "returnSecureToken": True,
-            },
-            timeout=10,
-        )
-        if not resp.ok:
+    def _swap(id_tok):
+        """用 Google id_token 换 Firebase ID token。失败返回 None。"""
+        if not id_tok:
             return None
-        firebase_token = resp.json().get("idToken", "")
+        try:
+            resp = requests.post(
+                f"https://identitytoolkit.googleapis.com/v1/accounts:signInWithIdp?key={api_key}",
+                json={
+                    "postBody": f"id_token={id_tok}&providerId=google.com",
+                    "requestUri": REDIRECT_URI,
+                    "returnSecureToken": True,
+                },
+                timeout=10,
+            )
+            if not resp.ok:
+                return None
+            return resp.json().get("idToken", "")
+        except Exception:
+            return None
+
+    # 第一次尝试:用 session 里现有的 id_token(可能已经过期 — Google id_token 1 小时过期)
+    firebase_token = _swap(user.get("id_token", ""))
+
+    if not firebase_token:
+        # Swap 失败 — 很可能是 id_token 过期。用 refresh_token 换一个新的再 swap。
+        # 没这层 retry,任何 session 开超过 1 小时所有 Firestore 写入会静默失败。
+        refresh_token = (user.get("creds") or {}).get("refresh_token", "")
+        if refresh_token:
+            new_token_data = _refresh_access_token(refresh_token)
+            if new_token_data and new_token_data.get("id_token"):
+                new_id_token = new_token_data["id_token"]
+                # 把新的 id_token 写回 session_state,下次就不用 refresh
+                if "user" in st.session_state:
+                    st.session_state["user"]["id_token"] = new_id_token
+                    if new_token_data.get("access_token"):
+                        st.session_state["user"]["creds"]["token"] = new_token_data["access_token"]
+                firebase_token = _swap(new_id_token)
+
+    if firebase_token:
         st.session_state["_firebase_id_token"] = firebase_token
         st.session_state["_firebase_id_token_at"] = now_ts
         return firebase_token
-    except Exception:
-        return None
+    return None
 
 
 def _ai_summary_hash(subject, thread_text):
